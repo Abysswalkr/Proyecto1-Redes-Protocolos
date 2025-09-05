@@ -4,7 +4,7 @@ servers:
     command: python
     args: ["porthunter_server.py"]
 
-  # Filesystem MCP (Node). Ajusta paths/flags 
+  # Filesystem MCP (Node). Ajusta paths/flags
   - name: filesystem
     command: npx
     args: ["-y", "@modelcontextprotocol/server-filesystem"]
