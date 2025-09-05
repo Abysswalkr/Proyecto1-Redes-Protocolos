@@ -1,0 +1,15 @@
+# Define los servidores MCP que tu chatbot conectará al iniciar
+servers:
+  - name: porthunter
+    command: python
+    args: ["porthunter_server.py"]
+
+  # Filesystem MCP (Node). Ajusta paths/flags 
+  - name: filesystem
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem"]
+
+  # Git MCP (Python). Apunta a un repo existente o vacío.
+  - name: git
+    command: uvx
+    args: ["mcp-server-git", "--repository", "./demo_repo"]
