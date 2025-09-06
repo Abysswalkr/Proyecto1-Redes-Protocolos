@@ -12,8 +12,8 @@ from app.config import (
 from app.llm.openrouter_client import OpenRouterClient
 from app.llm.memory import ConversationMemory
 
-# logger MCP
 from app.mcp.logger import MCPLogger
+from app.mcp.fs_client import run_demo_create_repo  # <-- NUEVO
 
 def ensure_dir(path: str) -> None:
     Path(path).mkdir(parents=True, exist_ok=True)
@@ -34,7 +34,6 @@ def run_chat_loop() -> None:
     )
     memory = ConversationMemory(max_messages=20)
 
-    # Logs
     ensure_dir("logs/chat")
     ensure_dir("logs/mcp")
     session_id = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -45,13 +44,13 @@ def run_chat_loop() -> None:
         "Eres un asistente útil y conciso. Responde en español, mantén el contexto de la conversación."
     )
 
-    print("Chat iniciado. Comandos: /reset, /exit, /mcp-dryrun, /mcp-log")
+    print("Chat iniciado. Comandos: /reset, /exit, /mcp-dryrun, /mcp-log, /mcp-demo-git [ruta]")
     while True:
         user_in = input(">>> ").strip()
         if not user_in:
             continue
 
-        # --- Comandos locales ---
+        # ---- Comandos locales ----
         if user_in.lower() in ("/exit", "/salir", "salir"):
             print("Saliendo. ¡Hasta luego!")
             break
@@ -63,19 +62,9 @@ def run_chat_loop() -> None:
             continue
 
         if user_in.lower().startswith("/mcp-dryrun"):
-            # Simula request/response (logger)
-            corr_id = mcp_logger.log_request(
-                server="filesystem",
-                tool="list_dir",
-                args={"path": "."},
-            )
-            mcp_logger.log_response(
-                correlation_id=corr_id,
-                server="filesystem",
-                tool="list_dir",
-                status="ok",
-                result={"entries": ["README.md", "app/", "logs/"]},
-            )
+            corr_id = mcp_logger.log_request("filesystem", "list_dir", {"path": "."})
+            mcp_logger.log_response(corr_id, "filesystem", "list_dir", "ok",
+                                    result={"entries": ["README.md", "app/", "logs/"]})
             print("(Dry-run MCP registrado en logs/mcp)")
             continue
 
@@ -86,7 +75,22 @@ def run_chat_loop() -> None:
                 print(line)
             print("--- fin ---\n")
             continue
-        # --- Fin comandos ---
+
+        if user_in.lower().startswith("/mcp-demo-git"):
+            # Permite /mcp-demo-git o /mcp-demo-git C:\ruta\repo
+            parts = user_in.split(maxsplit=1)
+            repo = parts[1].strip() if len(parts) > 1 else "mcp_demo_repo"
+            print(f"(Ejecutando demo MCP en: {repo})")
+            try:
+                steps = run_demo_create_repo(repo)
+                print("\n--- Demo MCP (Git + Filesystem) ---")
+                for s in steps:
+                    print(s)
+                print("--- fin ---\n")
+            except Exception as e:
+                print(f"(Error en demo MCP: {e})")
+            continue
+        # ---- Fin comandos ----
 
         # Flujo normal con LLM
         memory.add_user(user_in)
