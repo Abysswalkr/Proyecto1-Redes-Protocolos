@@ -1,4 +1,3 @@
-import os
 import json
 import time
 from datetime import datetime
@@ -13,13 +12,20 @@ from app.config import (
 from app.llm.openrouter_client import OpenRouterClient
 from app.llm.memory import ConversationMemory
 
+# logger MCP
+from app.mcp.logger import MCPLogger
 
 def ensure_dir(path: str) -> None:
     Path(path).mkdir(parents=True, exist_ok=True)
 
+def _now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+def _append_chat_log(path: Path, obj: dict) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 def run_chat_loop() -> None:
-    # Prep cliente y memoria
     client = OpenRouterClient(
         api_key=OPENROUTER_API_KEY,
         model=OPENROUTER_MODEL,
@@ -28,40 +34,67 @@ def run_chat_loop() -> None:
     )
     memory = ConversationMemory(max_messages=20)
 
-    # Log de chat por sesión
+    # Logs
     ensure_dir("logs/chat")
+    ensure_dir("logs/mcp")
     session_id = datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_path = Path("logs/chat") / f"session-{session_id}.jsonl"
+    chat_log_path = Path("logs/chat") / f"session-{session_id}.jsonl"
+    mcp_logger = MCPLogger(log_dir="logs/mcp")
 
     system_prompt = (
         "Eres un asistente útil y conciso. Responde en español, mantén el contexto de la conversación."
     )
 
-    print("Chat iniciado. Escribe tu mensaje. Comandos: /reset, /exit")
+    print("Chat iniciado. Comandos: /reset, /exit, /mcp-dryrun, /mcp-log")
     while True:
         user_in = input(">>> ").strip()
         if not user_in:
             continue
+
+        # --- Comandos locales ---
         if user_in.lower() in ("/exit", "/salir", "salir"):
             print("Saliendo. ¡Hasta luego!")
             break
+
         if user_in.lower() in ("/reset", "reset"):
             memory.reset()
             print("(Contexto borrado)")
-            _append_chat_log(log_path, {"event": "reset", "t": _now()})
+            _append_chat_log(chat_log_path, {"event": "reset", "t": _now()})
             continue
 
-        # Añadir turno del usuario a memoria
-        memory.add_user(user_in)
+        if user_in.lower().startswith("/mcp-dryrun"):
+            # Simula request/response (logger)
+            corr_id = mcp_logger.log_request(
+                server="filesystem",
+                tool="list_dir",
+                args={"path": "."},
+            )
+            mcp_logger.log_response(
+                correlation_id=corr_id,
+                server="filesystem",
+                tool="list_dir",
+                status="ok",
+                result={"entries": ["README.md", "app/", "logs/"]},
+            )
+            print("(Dry-run MCP registrado en logs/mcp)")
+            continue
 
-        # Construir mensajes con historia
+        if user_in.lower().startswith("/mcp-log"):
+            tail = mcp_logger.tail(10)
+            print("\n--- MCP LOG (últimas 10) ---")
+            for line in tail:
+                print(line)
+            print("--- fin ---\n")
+            continue
+        # --- Fin comandos ---
+
+        # Flujo normal con LLM
+        memory.add_user(user_in)
         messages = client.build_messages(
             user_prompt=user_in,
             system_prompt=system_prompt,
-            history=memory.get_history()[:-1],  # history sin el último user_in duplicado
+            history=memory.get_history()[:-1],
         )
-
-        # Llamar al LLM
         t0 = time.time()
         try:
             answer = client.chat(messages, temperature=0.2)
@@ -69,31 +102,19 @@ def run_chat_loop() -> None:
             answer = f"(Error al llamar al LLM: {e})"
         dt_ms = int((time.time() - t0) * 1000)
 
-        # Añadir respuesta a memoria
         memory.add_assistant(answer)
 
-        # Mostrar y loguear
         print("\n--- Respuesta ---")
         print(answer)
         print(f"\n({dt_ms} ms)\n")
 
-        _append_chat_log(log_path, {
+        _append_chat_log(chat_log_path, {
             "t": _now(),
             "user": user_in,
             "assistant": answer,
             "latency_ms": dt_ms,
             "model": OPENROUTER_MODEL,
         })
-
-
-def _now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
-
-
-def _append_chat_log(path: Path, obj: dict) -> None:
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-
 
 if __name__ == "__main__":
     run_chat_loop()

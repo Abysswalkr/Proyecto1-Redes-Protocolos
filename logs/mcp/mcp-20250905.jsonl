@@ -1,0 +1,2 @@
+{"t": "2025-09-05T17:43:55", "kind": "request", "correlation_id": "537356a4-d37e-44f6-a549-cfb4f0277032", "server": "filesystem", "tool": "list_dir", "args": {"path": "."}}
+{"t": "2025-09-05T17:43:55", "kind": "response", "correlation_id": "537356a4-d37e-44f6-a549-cfb4f0277032", "server": "filesystem", "tool": "list_dir", "status": "ok", "result": {"entries": ["README.md", "app/", "logs/"]}, "error": null}
