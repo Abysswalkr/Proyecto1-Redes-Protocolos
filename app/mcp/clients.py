@@ -63,3 +63,13 @@ def call_tool(
     arguments: Dict[str, Any],
 ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     return asyncio.run(_call_tool_async(server_params, tool_name, arguments))
+
+def porthunter_params(python_exe: str = "python", module: str = "porthunter.server") -> StdioServerParameters:
+    """
+    Ejecuta el servidor PortHunter MCP vía stdio:
+    """
+    return StdioServerParameters(
+        command=python_exe,
+        args=["-m", module],
+        env=os.environ.copy(),
+    )

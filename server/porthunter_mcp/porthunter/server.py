@@ -1,11 +1,9 @@
 from __future__ import annotations
-import json
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List
 
 from mcp.server.fastmcp import FastMCP
-from mcp.server.stdio import stdio_server
 
 app = FastMCP("PortHunter MCP")
 
@@ -18,9 +16,6 @@ def _exists_file(p: str) -> None:
 
 @app.tool()
 def scan_overview(path: str, time_window_s: int = 60, top_k: int = 20) -> Dict[str, Any]:
-    """
-    MOCK: Resumen de tráfico.
-    """
     _exists_file(path)
     return {
         "total_pkts": 123456,
@@ -75,10 +70,9 @@ def first_scan_event(path: str) -> Dict[str, Any]:
 
 @app.tool()
 def enrich_ip(ip: str) -> Dict[str, Any]:
-    # MOCK: valores de ejemplo.
     return {
         "ip": ip,
-        "otx": {"reputation": "low", "pulses": ["ExamplePulse"], "references": ["https://otx.alienvault.com/indicator/ip/" + ip]},
+        "otx": {"reputation": "low", "pulses": ["ExamplePulse"], "references": [f"https://otx.alienvault.com/indicator/ip/{ip}"]},
         "greynoise": {"noise": True, "classification": "benign-scanner"},
         "asn": {"asn": 64500, "org": "Example Cloud"},
         "geo": {"country": "US", "city": "ExampleCity"},
@@ -93,6 +87,4 @@ def correlate(ips: List[str]) -> Dict[str, Any]:
     return {"results": scored, "generated_at": _now()}
 
 if __name__ == "__main__":
-    # Ejecuta como servidor MCP stdio
-    with stdio_server() as (read, write):
-        app.run(read, write)
+    app.run()
