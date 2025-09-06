@@ -1,0 +1,10 @@
+[project]
+name = "porthunter-mcp"
+version = "0.1.0"
+description = "PortHunter MCP server: detección y perfilado de port scans (MCP)."
+requires-python = ">=3.10"
+dependencies = ["mcp>=1.2.0"]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
