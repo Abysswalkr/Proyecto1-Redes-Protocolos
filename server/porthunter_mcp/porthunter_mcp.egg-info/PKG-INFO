@@ -1,6 +1,11 @@
 Metadata-Version: 2.4
 Name: porthunter-mcp
-Version: 0.1.0
+Version: 0.2.0
 Summary: PortHunter MCP server: detección y perfilado de port scans (MCP).
 Requires-Python: >=3.10
-Requires-Dist: mcp>=1.2.0
+Requires-Dist: mcp>=1.13.0
+Requires-Dist: scapy>=2.5.0
+Requires-Dist: requests>=2.31.0
+Requires-Dist: ipwhois>=1.2.0
+Provides-Extra: geo
+Requires-Dist: geoip2>=4.8.0; extra == "geo"

@@ -1,9 +1,17 @@
 [project]
 name = "porthunter-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "PortHunter MCP server: detección y perfilado de port scans (MCP)."
 requires-python = ">=3.10"
-dependencies = ["mcp>=1.2.0"]
+dependencies = [
+  "mcp>=1.13.0",
+  "scapy>=2.5.0",
+  "requests>=2.31.0",
+  "ipwhois>=1.2.0"
+]
+
+[project.optional-dependencies]
+geo = ["geoip2>=4.8.0"]
 
 [build-system]
 requires = ["setuptools", "wheel"]
