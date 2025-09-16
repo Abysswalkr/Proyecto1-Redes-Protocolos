@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "remote-utils-mcp"
+version = "0.1.0"
+description = "Remote Utils MCP (SSE/HTTP)"
+requires-python = ">=3.10"
+dependencies = [
+  "mcp>=1.13.0",
+  "uvicorn>=0.31",
+  "starlette>=0.40",
+]
+
+[project.scripts]
+remote-utils-mcp = "remote_utils.server:__main__"  # opcional
+
+[tool.setuptools.packages.find]
+where = ["."]
