@@ -1,0 +1,2 @@
+{"t": "2025-09-16T17:23:59", "user": "/remote-list        # Debe listar: echo, time, dns_lookup", "assistant": "Los comandos disponibles son:\n\n- **echo**: Repite el mensaje proporcionado\n- **time**: Muestra la hora actual del servidor\n- **dns_lookup**: Resuelve nombres de dominio a direcciones IP", "latency_ms": 3074, "model": "qwen/qwen3-coder:free"}
+{"t": "2025-09-16T17:24:14", "user": "/remote-time        # Devuelve fecha/hora ISO UTC", "assistant": "2024-12-19T15:30:45Z", "latency_ms": 14241, "model": "qwen/qwen3-coder:free"}

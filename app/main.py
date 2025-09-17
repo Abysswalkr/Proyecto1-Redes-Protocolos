@@ -1,3 +1,4 @@
+# app/main.py
 import json
 import time
 from datetime import datetime
@@ -14,8 +15,15 @@ from app.llm.memory import ConversationMemory
 
 from app.mcp.logger import MCPLogger
 from app.mcp.fs_client import run_demo_create_repo
-from app.mcp.clients import porthunter_params, call_tool
-
+from app.mcp.clients import (
+    porthunter_params,
+    call_tool,
+    # remoto (SSE)
+    remote_set as mcp_remote_set,
+    remote_get as mcp_remote_get,
+    remote_list_tools as mcp_remote_list,
+    remote_call as mcp_remote_call,
+)
 
 # -------------------- utilidades locales --------------------
 
@@ -29,6 +37,8 @@ def _append_chat_log(path: Path, obj: dict) -> None:
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
+def _print_json(obj) -> None:
+    print(json.dumps(obj, indent=2, ensure_ascii=False))
 
 # -------------------- app principal --------------------
 
@@ -62,6 +72,11 @@ def run_chat_loop() -> None:
     print("  /porthunter-suspects <ruta.pcap>")
     print("  /porthunter-enrich <ip>")
     print("  /porthunter-correlate <ip1,ip2,...>")
+    print("  /remote-set <url>        (ej. http://127.0.0.1:8080)")
+    print("  /remote-list             (tools remotas)")
+    print("  /remote-echo <texto>")
+    print("  /remote-time")
+    print("  /remote-dns <host>")
     while True:
         user_in = input(">>> ").strip()
         if not user_in:
@@ -131,7 +146,7 @@ def run_chat_loop() -> None:
                 mcp_logger.log_response(corr, "porthunter", "scan_overview", "ok",
                                         result={"text": text, "data": data})
                 print("\n--- PortHunter: scan_overview ---")
-                print(json.dumps(data or {"text": text}, indent=2, ensure_ascii=False))
+                _print_json(data or {"text": text})
                 print("--- fin ---\n")
             except Exception as e:
                 mcp_logger.log_response(corr, "porthunter", "scan_overview", "error", error=str(e))
@@ -152,7 +167,7 @@ def run_chat_loop() -> None:
                 mcp_logger.log_response(corr, "porthunter", "first_scan_event", "ok",
                                         result={"text": text, "data": data})
                 print("\n--- PortHunter: first_scan_event ---")
-                print(json.dumps(data or {"text": text}, indent=2, ensure_ascii=False))
+                _print_json(data or {"text": text})
                 print("--- fin ---\n")
             except Exception as e:
                 mcp_logger.log_response(corr, "porthunter", "first_scan_event", "error", error=str(e))
@@ -177,7 +192,7 @@ def run_chat_loop() -> None:
                 mcp_logger.log_response(corr, "porthunter", "list_suspects", "ok",
                                         result={"text": text, "data": data})
                 print("\n--- PortHunter: list_suspects ---")
-                print(json.dumps(data or {"text": text}, indent=2, ensure_ascii=False))
+                _print_json(data or {"text": text})
                 print("--- fin ---\n")
             except Exception as e:
                 mcp_logger.log_response(corr, "porthunter", "list_suspects", "error", error=str(e))
@@ -198,7 +213,7 @@ def run_chat_loop() -> None:
                 mcp_logger.log_response(corr, "porthunter", "enrich_ip", "ok",
                                         result={"text": text, "data": data})
                 print("\n--- PortHunter: enrich_ip ---")
-                print(json.dumps(data or {"text": text}, indent=2, ensure_ascii=False))
+                _print_json(data or {"text": text})
                 print("--- fin ---\n")
             except Exception as e:
                 mcp_logger.log_response(corr, "porthunter", "enrich_ip", "error", error=str(e))
@@ -219,11 +234,92 @@ def run_chat_loop() -> None:
                 mcp_logger.log_response(corr, "porthunter", "correlate", "ok",
                                         result={"text": text, "data": data})
                 print("\n--- PortHunter: correlate ---")
-                print(json.dumps(data or {"text": text}, indent=2, ensure_ascii=False))
+                _print_json(data or {"text": text})
                 print("--- fin ---\n")
             except Exception as e:
                 mcp_logger.log_response(corr, "porthunter", "correlate", "error", error=str(e))
                 print(f"(Error PortHunter: {e})")
+            continue
+
+        # ---------- MCP REMOTO (SSE) ----------
+        if user_in.lower().startswith("/remote-set "):
+            url = user_in.split(" ", 1)[1].strip()
+            current = mcp_remote_set(url)
+            print(f"(Remoto apuntando a: {current})")
+            continue
+
+        if user_in.lower() == "/remote-list":
+            base = mcp_remote_get()
+            if not base:
+                print("Primero configura la URL: /remote-set <url>")
+                continue
+            corr = mcp_logger.log_request("remote-utils", "list_tools", {"base_url": base})
+            try:
+                text, data = mcp_remote_list()
+                mcp_logger.log_response(corr, "remote-utils", "list_tools", "ok",
+                                        result={"text": text, "data": data})
+                print("\n--- Remote: list_tools ---")
+                _print_json(data or {"text": text})
+                print("--- fin ---\n")
+            except Exception as e:
+                mcp_logger.log_response(corr, "remote-utils", "list_tools", "error", error=str(e))
+                print(f"(Error remoto list_tools: {e})")
+            continue
+
+        if user_in.lower().startswith("/remote-echo "):
+            base = mcp_remote_get()
+            if not base:
+                print("Primero configura la URL: /remote-set <url>")
+                continue
+            text_arg = user_in.split(" ", 1)[1]
+            corr = mcp_logger.log_request("remote-utils", "echo", {"text": text_arg})
+            try:
+                text, data = mcp_remote_call("echo", {"text": text_arg})
+                mcp_logger.log_response(corr, "remote-utils", "echo", "ok",
+                                        result={"text": text, "data": data})
+                print("\n--- Remote: echo ---")
+                _print_json(data or {"text": text})
+                print("--- fin ---\n")
+            except Exception as e:
+                mcp_logger.log_response(corr, "remote-utils", "echo", "error", error=str(e))
+                print(f"(Error remoto echo: {e})")
+            continue
+
+        if user_in.lower() == "/remote-time":
+            base = mcp_remote_get()
+            if not base:
+                print("Primero configura la URL: /remote-set <url>")
+                continue
+            corr = mcp_logger.log_request("remote-utils", "time", {})
+            try:
+                text, data = mcp_remote_call("time", {})
+                mcp_logger.log_response(corr, "remote-utils", "time", "ok",
+                                        result={"text": text, "data": data})
+                print("\n--- Remote: time ---")
+                _print_json(data or {"text": text})
+                print("--- fin ---\n")
+            except Exception as e:
+                mcp_logger.log_response(corr, "remote-utils", "time", "error", error=str(e))
+                print(f"(Error remoto time: {e})")
+            continue
+
+        if user_in.lower().startswith("/remote-dns "):
+            base = mcp_remote_get()
+            if not base:
+                print("Primero configura la URL: /remote-set <url>")
+                continue
+            host = user_in.split(" ", 1)[1].strip()
+            corr = mcp_logger.log_request("remote-utils", "dns_lookup", {"host": host})
+            try:
+                text, data = mcp_remote_call("dns_lookup", {"host": host})
+                mcp_logger.log_response(corr, "remote-utils", "dns_lookup", "ok",
+                                        result={"text": text, "data": data})
+                print("\n--- Remote: dns_lookup ---")
+                _print_json(data or {"text": text})
+                print("--- fin ---\n")
+            except Exception as e:
+                mcp_logger.log_response(corr, "remote-utils", "dns_lookup", "error", error=str(e))
+                print(f"(Error remoto dns_lookup: {e})")
             continue
 
         # ---------- Flujo normal con LLM ----------
@@ -253,7 +349,6 @@ def run_chat_loop() -> None:
             "latency_ms": dt_ms,
             "model": OPENROUTER_MODEL,
         })
-
 
 if __name__ == "__main__":
     run_chat_loop()
