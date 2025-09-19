@@ -1,10 +1,3 @@
-# app/cli.py
-# Mini-host MCP por STDIO (JSON-RPC 2.0) robusto para Windows.
-# - No usa SDK.
-# - No llama "initialize" (arranca con "tools/list").
-# - Filtra ruido hasta hallar "Content-Length:" limpio.
-# Ejecuta:  python -m app.cli
-
 import os, sys, json, shlex, subprocess, time
 from pathlib import Path
 from typing import Any, Dict, List, Optional

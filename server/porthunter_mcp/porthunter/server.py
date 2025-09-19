@@ -1,4 +1,3 @@
-# server/porthunter_mcp/porthunter/server.py
 from __future__ import annotations
 
 import os

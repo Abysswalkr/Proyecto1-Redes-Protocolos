@@ -1,4 +1,3 @@
-# app/mcp_porthunter.py
 import os, asyncio
 from pathlib import Path
 from mcp.client.stdio import StdioServerParams, connect_stdio
