@@ -1,4 +1,3 @@
-# server/porthunter_mcp/porthunter/stdio_server.py
 from __future__ import annotations
 
 import os
@@ -7,6 +6,9 @@ import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import re
+from datetime import datetime, UTC
+from ipaddress import ip_address, ip_network
 
 logging.basicConfig(
     level=os.getenv("PORT_HUNTER_LOG_LEVEL", "WARNING"),
@@ -36,8 +38,12 @@ from .utils.intel.geo import geo_lookup
 CACHE_FILE = CACHE_DIR / "intel_cache.json"
 cache = SimpleCache(CACHE_FILE, ttl_seconds=_ttl_days * 24 * 3600)
 
-from datetime import datetime, UTC
-from ipaddress import ip_address, ip_network
+# --- NUEVOS límites y banderas de seguridad (configurables por .env) ---
+REQUIRE_TOKEN = os.getenv("PORT_HUNTER_REQUIRE_TOKEN", "true").lower() in {"1", "true", "yes"}
+MAX_PCAP_MB   = int(os.getenv("PORT_HUNTER_MAX_PCAP_MB", "200"))  # tamaño duro por archivo
+ALLOWED_EXTS  = {".pcap", ".pcapng"}
+IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+# -----------------------------------------------------------------------
 
 _PRIVATE_NETS = [
     ip_network("10.0.0.0/8"),
@@ -50,6 +56,7 @@ _PRIVATE_NETS = [
     ip_network("fe80::/10"),
 ]
 
+# --- reemplazada (igual forma pero explícita) ---
 def _now() -> str:
     return datetime.now(UTC).isoformat()  # timezone-aware, sin warning
 
@@ -60,13 +67,34 @@ def _is_private_ip(ip: str) -> bool:
     except Exception:
         return True
 
+# --- helper nuevo: validar IP (v4/v6) ---
+def _is_valid_ip(ip: str) -> bool:
+    try:
+        ip_address(ip)  # acepta v4/v6
+        return True
+    except Exception:
+        return False
+
+# --- reemplazada: ahora respeta REQUIRE_TOKEN y valida configuración ---
 def _require_token(auth: Optional[str]) -> None:
-    if not ENV_TOKEN:
+    """
+    Si REQUIRE_TOKEN=true, rechaza todas las llamadas sin un token que
+    coincida con PORT_HUNTER_TOKEN.
+    """
+    if not REQUIRE_TOKEN:
         return
+    if not ENV_TOKEN:
+        raise PermissionError("server_misconfigured: missing PORT_HUNTER_TOKEN")
     if auth != ENV_TOKEN:
         raise PermissionError("authentication_required")
 
+# --- reemplazada: ahora fuerza extensión válida y tamaño máximo ---
 def _sanitize_path(path: str) -> Path:
+    """
+    1) normaliza y restringe a ALLOWED_DIR
+    2) obliga a extensión permitida
+    3) limita tamaño de archivo (MAX_PCAP_MB)
+    """
     p = (Path(path).expanduser()).resolve()
     if not str(p).startswith(str(ALLOWED_DIR)):
         raise ValueError("path_outside_allowed_dir")
@@ -74,8 +102,14 @@ def _sanitize_path(path: str) -> Path:
         raise FileNotFoundError("path_not_found")
     if not p.is_file():
         raise ValueError("path_not_a_file")
-    if p.suffix.lower() not in {".pcap", ".pcapng"}:
+    if p.suffix.lower() not in ALLOWED_EXTS:
         raise ValueError("unsupported_file_type")
+    try:
+        size_mb = p.stat().st_size / (1024 * 1024)
+    except Exception:
+        size_mb = MAX_PCAP_MB + 1  # fuerza rechazo si falla
+    if size_mb > MAX_PCAP_MB:
+        raise ValueError(f"file_too_large:{int(size_mb)}MB>{MAX_PCAP_MB}MB")
     return p
 
 def _safe_enrich_ip(ip: str) -> Dict[str, Any]:
@@ -245,23 +279,37 @@ def _handle_tools_call(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"content": [{"type": "json", "data": data}]}
 
     if name == "enrich_ip":
+        # --- reemplazado: valida token + IP antes de enriquecer ---
         try:
             _require_token(arguments.get("auth_token"))
-            ip = str(arguments.get("ip", ""))
+            ip = str(arguments.get("ip", "")).strip()
+            if not _is_valid_ip(ip):
+                raise ValueError("invalid_ip")
             data = {"ok": True, "enrichment": _safe_enrich_ip(ip), "generated_at": _now()}
         except Exception as e:
             data = {"ok": False, "error": str(e), "generated_at": _now()}
         return {"content": [{"type": "json", "data": data}]}
 
     if name == "correlate":
+        # --- reemplazado: valida IPs, marca inválidas con ok:false, conserva rationale ---
         try:
             _require_token(arguments.get("auth_token"))
-            ips = list(arguments.get("ips") or [])
+            ips_in = list(arguments.get("ips") or [])
             out: List[Dict[str, Any]] = []
-            for ip in ips:
+            for ip in ips_in:
+                ip = str(ip).strip()
+                if not _is_valid_ip(ip):
+                    out.append({"ip": ip, "ok": False, "error": "invalid_ip"})
+                    continue
                 enr = _safe_enrich_ip(ip)
                 if enr.get("skipped"):
-                    out.append({"ip": ip, "skipped": True, "reason": enr.get("reason"), "threat_score": 0, "rationale": ["private_ip"]})
+                    out.append({
+                        "ip": ip,
+                        "skipped": True,
+                        "reason": enr.get("reason"),
+                        "threat_score": 0,
+                        "rationale": ["private_ip"],
+                    })
                     continue
                 score = 0
                 rationale: List[str] = []
