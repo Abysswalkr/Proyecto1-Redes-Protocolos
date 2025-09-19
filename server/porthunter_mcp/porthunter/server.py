@@ -1,47 +1,60 @@
+# server/porthunter_mcp/porthunter/server.py
 from __future__ import annotations
+
 import os
+import sys
+import logging
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from ipaddress import ip_address, ip_network
 
 from mcp.server.fastmcp import FastMCP
-from mcp.types import InitializeRequest  # usado solo para tipar el initialize hook
 
-# Utils existentes del proyecto
-from .utils.pcap import analyze_pcap
+# Utils del proyecto
+from .utils.pcap import analyze_pcap   # <-- devuelve (overview, first_event)
 from .utils.cache import SimpleCache
 from .utils.intel.otx import otx_enrich
 from .utils.intel.greynoise import greynoise_enrich
 from .utils.intel.asn import asn_lookup
 from .utils.intel.geo import geo_lookup
 
-# ========= Configuración y helpers de seguridad =========
+# ------------ Logging (NUNCA stdout) ------------
+logging.basicConfig(
+    level=os.getenv("PORT_HUNTER_LOG_LEVEL", "WARNING"),
+    stream=sys.stderr,
+    format="%(levelname)s:%(name)s:%(message)s",
+)
+log = logging.getLogger("porthunter.server")
 
 APP_NAME = "PortHunter MCP"
 app = FastMCP(APP_NAME)
 
-# Entorno
-ENV_TOKEN = os.getenv("PORT_HUNTER_TOKEN")  # si existe, se exigirá
+# ------------ Config ------------
+ENV_TOKEN = os.getenv("PORT_HUNTER_TOKEN")  # si existe, se exige en cada tool
 ALLOWED_DIR = Path(os.getenv("PORT_HUNTER_ALLOWED_DIR", ".")).resolve()
 ALLOW_PRIVATE = os.getenv("PORT_HUNTER_ALLOW_PRIVATE", "false").lower() in {"1", "true", "yes"}
 
-# Caché local
-_CACHE_DIR = Path(os.getenv("PORT_HUNTER_CACHE_DIR", ".")).resolve()
-_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-_CACHE_FILE = _CACHE_DIR / "intel_cache.json"
-cache = SimpleCache(_CACHE_FILE, ttl_seconds=7 * 24 * 3600)
+# Caché
+CACHE_DIR = Path(os.getenv("PORT_HUNTER_CACHE_DIR", ".")).resolve()
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_FILE = CACHE_DIR / "intel_cache.json"
+try:
+    _ttl_days = int(os.getenv("PORT_HUNTER_CACHE_TTL_DAYS", "7"))
+except ValueError:
+    _ttl_days = 7
+cache = SimpleCache(CACHE_FILE, ttl_seconds=_ttl_days * 24 * 3600)
 
-# Redes privadas / no compartibles
+# Redes privadas
 _PRIVATE_NETS = [
     ip_network("10.0.0.0/8"),
     ip_network("172.16.0.0/12"),
     ip_network("192.168.0.0/16"),
     ip_network("127.0.0.0/8"),
-    ip_network("169.254.0.0/16"),   # link-local
+    ip_network("169.254.0.0/16"),
     ip_network("::1/128"),
-    ip_network("fc00::/7"),         # unique local
-    ip_network("fe80::/10"),        # link-local v6
+    ip_network("fc00::/7"),
+    ip_network("fe80::/10"),
 ]
 
 def _now() -> str:
@@ -52,19 +65,15 @@ def _is_private_ip(ip: str) -> bool:
         addr = ip_address(ip)
         return any(addr in net for net in _PRIVATE_NETS)
     except Exception:
-        # Si no es una IP válida, trátala como "no enriquecible"
         return True
 
-def _require_token(headers: Dict[str, str] | None) -> None:
-    """Exige token si PORT_HUNTER_TOKEN está definido."""
+def _require_token(auth_token: Optional[str]) -> None:
     if not ENV_TOKEN:
         return
-    given = (headers or {}).get("X-Auth-Token") or (headers or {}).get("x-auth-token")
-    if given != ENV_TOKEN:
+    if auth_token != ENV_TOKEN:
         raise PermissionError("authentication_required")
 
 def _sanitize_path(path: str) -> Path:
-    """Valida ruta dentro de ALLOWED_DIR y tipos de archivo permitidos."""
     p = (Path(path).expanduser()).resolve()
     if not str(p).startswith(str(ALLOWED_DIR)):
         raise ValueError("path_outside_allowed_dir")
@@ -77,7 +86,6 @@ def _sanitize_path(path: str) -> Path:
     return p
 
 def _safe_enrich_ip(ip: str) -> Dict[str, Any]:
-    """Enriquecimiento con política do-not-share para IPs privadas."""
     if _is_private_ip(ip) and not ALLOW_PRIVATE:
         return {
             "ip": ip,
@@ -85,10 +93,10 @@ def _safe_enrich_ip(ip: str) -> Dict[str, Any]:
             "reason": "private_or_local_ip",
             "generated_at": _now(),
         }
-    # OTX / GreyNoise claves desde entorno (opcionales)
+
     otx_key = os.getenv("OTX_API_KEY")
     gn_key = os.getenv("GREYNOISE_API_KEY")
-    geo_db = os.getenv("GEOLITE2_CITY_DB")  # ruta a GeoLite2 opcional
+    geo_db = os.getenv("GEOLITE2_CITY_DB") or os.getenv("GEOIP_DB_PATH")
 
     cache_key = f"enrich:{ip}"
     cached = cache.get(cache_key)
@@ -100,128 +108,141 @@ def _safe_enrich_ip(ip: str) -> Dict[str, Any]:
     out["greynoise"] = greynoise_enrich(ip, gn_key)
     out["asn"] = asn_lookup(ip)
     out["geo"] = geo_lookup(ip, geo_db)
-
     cache.set(cache_key, out)
     return out
 
-# ========= Hooks MCP (initialize) con auth opcional =========
+# ------------ TOOLS ------------
 
-@app.initialize()
-def _on_initialize(req: InitializeRequest) -> Dict[str, Any]:
+@app.tool()
+def get_info(auth_token: Optional[str] = None) -> Dict[str, Any]:
     """
-    Si PORT_HUNTER_TOKEN está definido, exigimos encabezado X-Auth-Token en initialize.headers.
+    Estado del servidor. Si PORT_HUNTER_TOKEN está definido, exige auth_token.
     """
     try:
-        _require_token(getattr(req, "headers", None))  # algunas implementaciones envían headers
+        _require_token(auth_token)
         return {
+            "ok": True,
             "serverInfo": {"name": APP_NAME, "version": "1.0"},
             "protocolVersion": "2025-06-18",
             "capabilities": {"tools": True},
-            "generated_at": _now(),
             "secure_mode": bool(ENV_TOKEN),
             "allow_private": ALLOW_PRIVATE,
             "allowed_dir": str(ALLOWED_DIR),
+            "cache_file": str(CACHE_FILE),
+            "ttl_days": _ttl_days,
+            "generated_at": _now(),
         }
-    except PermissionError:
-        return {"error": "authentication_required", "generated_at": _now()}
-
-# ========= Tools =========
+    except PermissionError as e:
+        return {"ok": False, "error": str(e), "generated_at": _now()}
 
 @app.tool()
-def scan_overview(path: str, time_window_s: int = 60, top_k: int = 20, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+def scan_overview(
+    path: str,
+    time_window_s: int = 60,
+    top_k: int = 20,
+    auth_token: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Resumen de actividad en el PCAP.
-    Seguridad: token + ruta validada + sandbox.
     """
-    _require_token(headers)
-    p = _sanitize_path(path)
     try:
-        res = analyze_pcap(str(p), time_window_s=time_window_s, top_k=top_k)
-        return {"ok": True, "overview": res, "generated_at": _now()}
+        _require_token(auth_token)
+        p = _sanitize_path(path)
+        overview, first_event = analyze_pcap(str(p), time_window_s=time_window_s, top_k=top_k)
+        return {"ok": True, "overview": overview, "first_event": first_event, "generated_at": _now()}
     except Exception as e:
+        log.exception("scan_overview error")
         return {"ok": False, "error": str(e), "generated_at": _now()}
 
 @app.tool()
-def list_suspects(path: str, min_ports: int = 10, min_rate_pps: float = 5.0, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+def list_suspects(
+    path: str,
+    min_ports: int = 10,
+    min_rate_pps: float = 5.0,
+    auth_token: Optional[str] = None,
+) -> Dict[str, Any]:
     """
-    Lista de sospechosos con evidencia.
-    Seguridad: token + ruta validada + sandbox.
+    Lista de sospechosos con umbrales simples: número de puertos distintos y tasa (pps).
     """
-    _require_token(headers)
-    p = _sanitize_path(path)
     try:
-        res = analyze_pcap(str(p), time_window_s=60, top_k=100)  # reutilizamos overview interno
-        suspects = []
-        for s in res.get("src_stats", []):
-            # filtros mínimos
-            if s.get("distinct_ports", 0) >= int(min_ports) and s.get("rate_pps", 0.0) >= float(min_rate_pps):
-                pat = s.get("pattern") or "mixed"
-                v_score = float(s.get("vertical_score", 0.0))
-                h_score = float(s.get("horizontal_score", 0.0))
+        _require_token(auth_token)
+        p = _sanitize_path(path)
+        overview, _ = analyze_pcap(str(p), time_window_s=60, top_k=200)
+
+        interval = max(1, int(overview.get("interval_s", 0)) or 1)
+        suspects: List[Dict[str, Any]] = []
+        # En nuestro pcap.py la lista de candidatos está en "scanners"
+        for s in overview.get("scanners", []):
+            pkts = int(s.get("pkts", 0))
+            distinct_ports = int(s.get("distinct_ports", 0))
+            distinct_hosts = int(s.get("distinct_hosts", 0))
+            rate_pps = pkts / float(interval)
+            if distinct_ports >= int(min_ports) and rate_pps >= float(min_rate_pps):
+                # Scores simples (0..100) para reporte
+                vertical_score = min(100.0, distinct_ports * 2.0)      # puertos distintos
+                horizontal_score = min(100.0, distinct_hosts * 5.0)     # hosts distintos
                 suspects.append({
                     "scanner": s.get("ip"),
-                    "pattern": pat,
-                    "vertical_score": round(v_score, 2),
-                    "horizontal_score": round(h_score, 2),
+                    "pattern": s.get("pattern") or "mixed",
+                    "rate_pps": round(rate_pps, 2),
+                    "vertical_score": round(vertical_score, 2),
+                    "horizontal_score": round(horizontal_score, 2),
                     "evidence": {
                         "first_t": s.get("first_t"),
-                        "pkts": s.get("pkts"),
-                        "unique_ports": s.get("distinct_ports"),
-                        "unique_targets": s.get("distinct_hosts"),
+                        "pkts": pkts,
+                        "unique_ports": distinct_ports,
+                        "unique_targets": distinct_hosts,
                         "flag_stats": s.get("flag_stats", {}),
-                    }
+                    },
                 })
+
         return {"ok": True, "suspects": suspects, "generated_at": _now()}
     except Exception as e:
+        log.exception("list_suspects error")
         return {"ok": False, "error": str(e), "generated_at": _now()}
 
 @app.tool()
-def first_scan_event(path: str, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+def first_scan_event(path: str, auth_token: Optional[str] = None) -> Dict[str, Any]:
     """
-    Primer evento de escaneo (timestamp + quién + a quién + puerto).
+    Primer evento de escaneo detectado.
     """
-    _require_token(headers)
-    p = _sanitize_path(path)
     try:
-        res = analyze_pcap(str(p), time_window_s=60, top_k=100)
-        fe = res.get("first_event")
-        if not fe:
-            return {"ok": True, "first_event": None, "generated_at": _now()}
+        _require_token(auth_token)
+        p = _sanitize_path(path)
+        _, fe = analyze_pcap(str(p), time_window_s=60, top_k=50)
         return {"ok": True, "first_event": fe, "generated_at": _now()}
     except Exception as e:
+        log.exception("first_scan_event error")
         return {"ok": False, "error": str(e), "generated_at": _now()}
 
 @app.tool()
-def enrich_ip(ip: str, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+def enrich_ip(ip: str, auth_token: Optional[str] = None) -> Dict[str, Any]:
     """
-    Enriquecimiento con OTX, GreyNoise, ASN y Geo (con política do-not-share).
+    Enriquecimiento OTX, GreyNoise, ASN y Geo con política do-not-share para IPs privadas.
     """
-    _require_token(headers)
     try:
+        _require_token(auth_token)
         return {"ok": True, "enrichment": _safe_enrich_ip(ip), "generated_at": _now()}
     except Exception as e:
         return {"ok": False, "error": str(e), "generated_at": _now()}
 
 @app.tool()
-def correlate(ips: List[str], headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+def correlate(ips: List[str], auth_token: Optional[str] = None) -> Dict[str, Any]:
     """
-    Puntaje 0–100 por IP a partir de:
-    - Evidencia local (si ya fue enriquecida antes, podemos derivar heurísticas).
-    - Evidencia externa (OTX/GN/ASN/Geo).
-    NOTA: Heurística simple y transparente para fines académicos.
+    Puntaje simple 0–100 por IP a partir de evidencias externas.
     """
-    _require_token(headers)
     try:
+        _require_token(auth_token)
         out: List[Dict[str, Any]] = []
         for ip in ips:
             enr = _safe_enrich_ip(ip)
             if enr.get("skipped"):
-                out.append({"ip": ip, "skipped": True, "reason": enr.get("reason"), "threat_score": 0, "rationale": ["private_ip"]})
+                out.append({"ip": ip, "skipped": True, "reason": enr.get("reason"),
+                            "threat_score": 0, "rationale": ["private_ip"]})
                 continue
 
             score = 0
             rationale: List[str] = []
-            # Evidencia externa
             otx = enr.get("otx", {})
             if otx.get("enabled") and otx.get("pulse_count", 0) > 0:
                 score += min(40, 10 + otx["pulse_count"] * 2)
@@ -236,8 +257,7 @@ def correlate(ips: List[str], headers: Optional[Dict[str, str]] = None) -> Dict[
                 score += 10
                 rationale.append("asn:cloud")
             geo = enr.get("geo", {})
-            if geo.get("enabled") and geo.get("country") and geo.get("country") not in {"GT"}:
-                score += 5
+            if geo.get("enabled") and geo.get("country"):
                 rationale.append(f"geo:{geo.get('country')}")
 
             out.append({"ip": ip, "threat_score": min(100, score), "rationale": rationale})
@@ -245,5 +265,28 @@ def correlate(ips: List[str], headers: Optional[Dict[str, str]] = None) -> Dict[
     except Exception as e:
         return {"ok": False, "error": str(e), "generated_at": _now()}
 
+# ------------ Main (STDIO, NO HTTP) ------------
 if __name__ == "__main__":
-    app.run()
+    # Usar el adaptador de STDIO del submódulo correcto
+    try:
+        import mcp.server.fastmcp.stdio as _stdio  # ✅ submódulo real
+    except Exception as e:
+        logging.error(
+            "No se pudo importar fastmcp.stdio (necesario para STDIO): %s", e
+        )
+        sys.exit(2)
+
+    try:
+        import anyio
+        # Algunas versiones exponen stdio.serve(app), otras stdio.run(app)
+        if hasattr(_stdio, "serve"):
+            anyio.run(_stdio.serve, app)
+        elif hasattr(_stdio, "run"):
+            anyio.run(_stdio.run, app)
+        else:
+            raise RuntimeError(
+                "La versión de fastmcp.stdio no expone ni 'serve' ni 'run'"
+            )
+    except Exception:
+        logging.exception("Fallo al iniciar el servidor STDIO de MCP")
+        sys.exit(2)

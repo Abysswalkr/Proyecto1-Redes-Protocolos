@@ -1,354 +1,196 @@
-# app/main.py
+# app/cli.py
+# CLI anfitrión (mini-host) para hablar con el servidor MCP de PortHunter por STDIO.
+# Ejecuta:  python -m app.cli
+# Requisitos:
+#   pip install -e ./server/porthunter_mcp
+#   (opcional) pip install python-dotenv
+
+import os
+import sys
 import json
-import time
-from datetime import datetime
+import shlex
+import asyncio
 from pathlib import Path
+from typing import Any, Dict, List
 
-from app.config import (
-    OPENROUTER_API_KEY,
-    OPENROUTER_MODEL,
-    APP_TITLE,
-    REQUEST_TIMEOUT_SECONDS,
+# (Opcional) Cargar .env automáticamente si existe
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    pass
+
+# ===================== Config =====================
+
+ROOT_DIR = Path(__file__).resolve().parents[1]  # carpeta raíz del repo
+DEFAULT_PCAP_DIR = ROOT_DIR / "captures"
+
+TOKEN: str = os.getenv("PORT_HUNTER_TOKEN", "MiTOKENultraSecreto123")
+PCAP_DIR: Path = Path(os.getenv("PORT_HUNTER_ALLOWED_DIR", str(DEFAULT_PCAP_DIR))).resolve()
+
+# Variables que se inyectarán al proceso del servidor MCP
+SERVER_ENV: Dict[str, str] = {
+    "PORT_HUNTER_TOKEN": TOKEN,
+    "PORT_HUNTER_ALLOWED_DIR": str(PCAP_DIR),
+    "PORT_HUNTER_ALLOW_PRIVATE": os.getenv("PORT_HUNTER_ALLOW_PRIVATE", "false"),
+    "PORT_HUNTER_CACHE_DIR": os.getenv("PORT_HUNTER_CACHE_DIR", ".cache/porthunter"),
+    "OTX_API_KEY": os.getenv("OTX_API_KEY", ""),
+    "GREYNOISE_API_KEY": os.getenv("GREYNOISE_API_KEY", ""),
+    # Acepta ambos nombres para mayor compatibilidad:
+    "GEOLITE2_CITY_DB": os.getenv("GEOLITE2_CITY_DB") or os.getenv("GEOIP_DB_PATH", ""),
+}
+
+# ===================== Cliente MCP (STDIO) =====================
+
+# Compatibilidad con distintas versiones del SDK:
+try:
+    from mcp.client.stdio import StdioServerParameters as _StdParams  # >= algunas versiones
+except ImportError:  # pragma: no cover
+    from mcp.client.stdio import StdioServerParams as _StdParams      # otras versiones
+try:
+    from mcp.client.stdio import connect_stdio as _connect_stdio
+except ImportError:  # pragma: no cover
+    from mcp.client.stdio import connect as _connect_stdio
+
+PORT_HUNTER = _StdParams(
+    command="python",
+    args=["-m", "porthunter.server"],
+    env=SERVER_ENV,
 )
-from app.llm.openrouter_client import OpenRouterClient
-from app.llm.memory import ConversationMemory
 
-from app.mcp.logger import MCPLogger
-from app.mcp.fs_client import run_demo_create_repo
-from app.mcp.clients import (
-    porthunter_params,
-    call_tool,
-    # remoto (SSE)
-    remote_set as mcp_remote_set,
-    remote_get as mcp_remote_get,
-    remote_list_tools as mcp_remote_list,
-    remote_call as mcp_remote_call,
-)
+async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
+    """
+    Abre una sesión STDIO con el server MCP, llama una tool y devuelve el primer content útil.
+    Cerramos la sesión tras cada comando para simplificar la vida.
+    """
+    async with await _connect_stdio(PORT_HUNTER) as (client, _proc):
+        rsp = await client.call_tool(name, arguments)
+        if not rsp or not rsp.content:
+            return None
+        # Normalizamos respuesta: priorizamos JSON, luego texto
+        for part in rsp.content:
+            t = getattr(part, "type", None)
+            if t == "json":
+                return part.data
+            if t == "text":
+                try:
+                    return json.loads(part.text)
+                except Exception:
+                    return part.text
+        return None
 
-# -------------------- utilidades locales --------------------
+# ===================== Helpers =====================
 
-def ensure_dir(path: str) -> None:
-    Path(path).mkdir(parents=True, exist_ok=True)
+def abs_pcap_path(arg_path: str) -> str:
+    """Convierte una ruta a absoluta; si viene relativa, resuelve contra PCAP_DIR."""
+    p = Path(arg_path)
+    if not p.is_absolute():
+        p = (PCAP_DIR / p).resolve()
+    return str(p)
 
-def _now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+def pretty_print(obj: Any) -> None:
+    print("\n--- Respuesta ---")
+    try:
+        print(json.dumps(obj, indent=2, ensure_ascii=False))
+    except Exception:
+        print(obj)
+    print()
 
-def _append_chat_log(path: Path, obj: dict) -> None:
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+def print_banner() -> None:
+    print("MCP Chatbot – PortHunter (STDIO)")
+    print("Directorio de PCAP permitido:", PCAP_DIR)
+    print()
+    print("Comandos disponibles:")
+    print("  /ph-info")
+    print("  /ph-overview <archivo.pcap|pcapng>")
+    print("  /ph-first <archivo.pcap|pcapng>")
+    print("  /ph-suspects <archivo.pcap|pcapng>")
+    print("  /ph-enrich <ip>")
+    print("  /ph-correlate <ip1,ip2,...>")
+    print("  /help")
+    print("  /exit")
+    print()
 
-def _print_json(obj) -> None:
-    print(json.dumps(obj, indent=2, ensure_ascii=False))
+# ===================== Comandos =====================
 
-# -------------------- app principal --------------------
+async def cmd_ph_info() -> None:
+    data = await call_tool("get_info", {"auth_token": TOKEN})
+    pretty_print(data)
 
-def run_chat_loop() -> None:
-    # Cliente LLM y memoria
-    client = OpenRouterClient(
-        api_key=OPENROUTER_API_KEY,
-        model=OPENROUTER_MODEL,
-        app_title=APP_TITLE,
-        timeout_seconds=REQUEST_TIMEOUT_SECONDS,
-    )
-    memory = ConversationMemory(max_messages=20)
+async def cmd_ph_overview(path_arg: str) -> None:
+    path = abs_pcap_path(path_arg)
+    data = await call_tool("scan_overview", {"path": path, "auth_token": TOKEN})
+    pretty_print(data)
 
-    # Logs de chat y MCP
-    ensure_dir("logs/chat")
-    ensure_dir("logs/mcp")
-    session_id = datetime.now().strftime("%Y%m%d-%H%M%S")
-    chat_log_path = Path("logs/chat") / f"session-{session_id}.jsonl"
-    mcp_logger = MCPLogger(log_dir="logs/mcp")
+async def cmd_ph_first(path_arg: str) -> None:
+    path = abs_pcap_path(path_arg)
+    data = await call_tool("first_scan_event", {"path": path, "auth_token": TOKEN})
+    pretty_print(data)
 
-    system_prompt = (
-        "Eres un asistente útil y conciso. Responde en español y conserva el contexto de la conversación."
-    )
+async def cmd_ph_suspects(path_arg: str) -> None:
+    path = abs_pcap_path(path_arg)
+    data = await call_tool("list_suspects", {"path": path, "auth_token": TOKEN})
+    pretty_print(data)
 
-    print("Chat iniciado. Comandos:")
-    print("  /reset, /exit")
-    print("  /mcp-dryrun, /mcp-log")
-    print("  /mcp-demo-git [ruta]")
-    print("  /porthunter-overview <ruta.pcap>")
-    print("  /porthunter-first <ruta.pcap>")
-    print("  /porthunter-suspects <ruta.pcap>")
-    print("  /porthunter-enrich <ip>")
-    print("  /porthunter-correlate <ip1,ip2,...>")
-    print("  /remote-set <url>        (ej. http://127.0.0.1:8080)")
-    print("  /remote-list             (tools remotas)")
-    print("  /remote-echo <texto>")
-    print("  /remote-time")
-    print("  /remote-dns <host>")
+async def cmd_ph_enrich(ip: str) -> None:
+    data = await call_tool("enrich_ip", {"ip": ip, "auth_token": TOKEN})
+    pretty_print(data)
+
+async def cmd_ph_correlate(ips_csv: str) -> None:
+    ips = [s.strip() for s in ips_csv.split(",") if s.strip()]
+    data = await call_tool("correlate", {"ips": ips, "auth_token": TOKEN})
+    pretty_print(data)
+
+# ===================== Loop interactivo =====================
+
+async def repl() -> None:
+    print_banner()
     while True:
-        user_in = input(">>> ").strip()
-        if not user_in:
-            continue
-
-        # ---------- Comandos locales ----------
-        if user_in.lower() in ("/exit", "/salir", "salir"):
-            print("Saliendo. ¡Hasta luego!")
-            break
-
-        if user_in.lower() in ("/reset", "reset"):
-            memory.reset()
-            print("(Contexto borrado)")
-            _append_chat_log(chat_log_path, {"event": "reset", "t": _now()})
-            continue
-
-        if user_in.lower().startswith("/mcp-dryrun"):
-            corr_id = mcp_logger.log_request("filesystem", "list_dir", {"path": "."})
-            mcp_logger.log_response(
-                correlation_id=corr_id,
-                server="filesystem",
-                tool="list_dir",
-                status="ok",
-                result={"entries": ["README.md", "app/", "logs/"]},
-            )
-            print("(Dry-run MCP registrado en logs/mcp)")
-            continue
-
-        if user_in.lower().startswith("/mcp-log"):
-            tail = mcp_logger.tail(10)
-            print("\n--- MCP LOG (últimas 10) ---")
-            for line in tail:
-                print(line)
-            print("--- fin ---\n")
-            continue
-
-        if user_in.lower().startswith("/mcp-demo-git"):
-            # /mcp-demo-git  o  /mcp-demo-git C:\ruta\repo
-            parts = user_in.split(maxsplit=1)
-            repo = parts[1].strip() if len(parts) > 1 else "mcp_demo_repo"
-            print(f"(Ejecutando demo MCP en: {repo})")
-            try:
-                steps = run_demo_create_repo(repo)
-                print("\n--- Demo MCP (Git + Filesystem) ---")
-                for s in steps:
-                    print(s)
-                print("--- fin ---\n")
-            except Exception as e:
-                print(f"(Error en demo MCP: {e})")
-            continue
-
-        # ---- PortHunter: overview ----
-        if user_in.lower().startswith("/porthunter-overview"):
-            parts = user_in.split(maxsplit=1)
-            if len(parts) < 2:
-                print("Uso: /porthunter-overview <ruta.pcap>")
-                continue
-            pcap_path = parts[1].strip()
-            params = porthunter_params()
-            corr = mcp_logger.log_request(
-                "porthunter", "scan_overview",
-                {"path": pcap_path, "time_window_s": 60, "top_k": 20},
-            )
-            try:
-                text, data = call_tool(params, "scan_overview",
-                                       {"path": pcap_path, "time_window_s": 60, "top_k": 20})
-                mcp_logger.log_response(corr, "porthunter", "scan_overview", "ok",
-                                        result={"text": text, "data": data})
-                print("\n--- PortHunter: scan_overview ---")
-                _print_json(data or {"text": text})
-                print("--- fin ---\n")
-            except Exception as e:
-                mcp_logger.log_response(corr, "porthunter", "scan_overview", "error", error=str(e))
-                print(f"(Error PortHunter: {e})")
-            continue
-
-        # ---- PortHunter: primer evento ----
-        if user_in.lower().startswith("/porthunter-first"):
-            parts = user_in.split(maxsplit=1)
-            if len(parts) < 2:
-                print("Uso: /porthunter-first <ruta.pcap>")
-                continue
-            pcap_path = parts[1].strip()
-            params = porthunter_params()
-            corr = mcp_logger.log_request("porthunter", "first_scan_event", {"path": pcap_path})
-            try:
-                text, data = call_tool(params, "first_scan_event", {"path": pcap_path})
-                mcp_logger.log_response(corr, "porthunter", "first_scan_event", "ok",
-                                        result={"text": text, "data": data})
-                print("\n--- PortHunter: first_scan_event ---")
-                _print_json(data or {"text": text})
-                print("--- fin ---\n")
-            except Exception as e:
-                mcp_logger.log_response(corr, "porthunter", "first_scan_event", "error", error=str(e))
-                print(f"(Error PortHunter: {e})")
-            continue
-
-        # ---- PortHunter: sospechosos ----
-        if user_in.lower().startswith("/porthunter-suspects"):
-            parts = user_in.split(maxsplit=1)
-            if len(parts) < 2:
-                print("Uso: /porthunter-suspects <ruta.pcap>")
-                continue
-            pcap_path = parts[1].strip()
-            params = porthunter_params()
-            corr = mcp_logger.log_request(
-                "porthunter", "list_suspects",
-                {"path": pcap_path, "min_ports": 10, "min_rate_pps": 5},
-            )
-            try:
-                text, data = call_tool(params, "list_suspects",
-                                       {"path": pcap_path, "min_ports": 10, "min_rate_pps": 5})
-                mcp_logger.log_response(corr, "porthunter", "list_suspects", "ok",
-                                        result={"text": text, "data": data})
-                print("\n--- PortHunter: list_suspects ---")
-                _print_json(data or {"text": text})
-                print("--- fin ---\n")
-            except Exception as e:
-                mcp_logger.log_response(corr, "porthunter", "list_suspects", "error", error=str(e))
-                print(f"(Error PortHunter: {e})")
-            continue
-
-        # ---- PortHunter: enrich ----
-        if user_in.lower().startswith("/porthunter-enrich"):
-            parts = user_in.split(maxsplit=1)
-            if len(parts) < 2:
-                print("Uso: /porthunter-enrich <ip>")
-                continue
-            ip = parts[1].strip()
-            params = porthunter_params()
-            corr = mcp_logger.log_request("porthunter", "enrich_ip", {"ip": ip})
-            try:
-                text, data = call_tool(params, "enrich_ip", {"ip": ip})
-                mcp_logger.log_response(corr, "porthunter", "enrich_ip", "ok",
-                                        result={"text": text, "data": data})
-                print("\n--- PortHunter: enrich_ip ---")
-                _print_json(data or {"text": text})
-                print("--- fin ---\n")
-            except Exception as e:
-                mcp_logger.log_response(corr, "porthunter", "enrich_ip", "error", error=str(e))
-                print(f"(Error PortHunter: {e})")
-            continue
-
-        # ---- PortHunter: correlate ----
-        if user_in.lower().startswith("/porthunter-correlate"):
-            parts = user_in.split(maxsplit=1)
-            if len(parts) < 2:
-                print("Uso: /porthunter-correlate <ip1,ip2,...>")
-                continue
-            ips = [s.strip() for s in parts[1].split(",") if s.strip()]
-            params = porthunter_params()
-            corr = mcp_logger.log_request("porthunter", "correlate", {"ips": ips})
-            try:
-                text, data = call_tool(params, "correlate", {"ips": ips})
-                mcp_logger.log_response(corr, "porthunter", "correlate", "ok",
-                                        result={"text": text, "data": data})
-                print("\n--- PortHunter: correlate ---")
-                _print_json(data or {"text": text})
-                print("--- fin ---\n")
-            except Exception as e:
-                mcp_logger.log_response(corr, "porthunter", "correlate", "error", error=str(e))
-                print(f"(Error PortHunter: {e})")
-            continue
-
-        # ---------- MCP REMOTO (SSE) ----------
-        if user_in.lower().startswith("/remote-set "):
-            url = user_in.split(" ", 1)[1].strip()
-            current = mcp_remote_set(url)
-            print(f"(Remoto apuntando a: {current})")
-            continue
-
-        if user_in.lower() == "/remote-list":
-            base = mcp_remote_get()
-            if not base:
-                print("Primero configura la URL: /remote-set <url>")
-                continue
-            corr = mcp_logger.log_request("remote-utils", "list_tools", {"base_url": base})
-            try:
-                text, data = mcp_remote_list()
-                mcp_logger.log_response(corr, "remote-utils", "list_tools", "ok",
-                                        result={"text": text, "data": data})
-                print("\n--- Remote: list_tools ---")
-                _print_json(data or {"text": text})
-                print("--- fin ---\n")
-            except Exception as e:
-                mcp_logger.log_response(corr, "remote-utils", "list_tools", "error", error=str(e))
-                print(f"(Error remoto list_tools: {e})")
-            continue
-
-        if user_in.lower().startswith("/remote-echo "):
-            base = mcp_remote_get()
-            if not base:
-                print("Primero configura la URL: /remote-set <url>")
-                continue
-            text_arg = user_in.split(" ", 1)[1]
-            corr = mcp_logger.log_request("remote-utils", "echo", {"text": text_arg})
-            try:
-                text, data = mcp_remote_call("echo", {"text": text_arg})
-                mcp_logger.log_response(corr, "remote-utils", "echo", "ok",
-                                        result={"text": text, "data": data})
-                print("\n--- Remote: echo ---")
-                _print_json(data or {"text": text})
-                print("--- fin ---\n")
-            except Exception as e:
-                mcp_logger.log_response(corr, "remote-utils", "echo", "error", error=str(e))
-                print(f"(Error remoto echo: {e})")
-            continue
-
-        if user_in.lower() == "/remote-time":
-            base = mcp_remote_get()
-            if not base:
-                print("Primero configura la URL: /remote-set <url>")
-                continue
-            corr = mcp_logger.log_request("remote-utils", "time", {})
-            try:
-                text, data = mcp_remote_call("time", {})
-                mcp_logger.log_response(corr, "remote-utils", "time", "ok",
-                                        result={"text": text, "data": data})
-                print("\n--- Remote: time ---")
-                _print_json(data or {"text": text})
-                print("--- fin ---\n")
-            except Exception as e:
-                mcp_logger.log_response(corr, "remote-utils", "time", "error", error=str(e))
-                print(f"(Error remoto time: {e})")
-            continue
-
-        if user_in.lower().startswith("/remote-dns "):
-            base = mcp_remote_get()
-            if not base:
-                print("Primero configura la URL: /remote-set <url>")
-                continue
-            host = user_in.split(" ", 1)[1].strip()
-            corr = mcp_logger.log_request("remote-utils", "dns_lookup", {"host": host})
-            try:
-                text, data = mcp_remote_call("dns_lookup", {"host": host})
-                mcp_logger.log_response(corr, "remote-utils", "dns_lookup", "ok",
-                                        result={"text": text, "data": data})
-                print("\n--- Remote: dns_lookup ---")
-                _print_json(data or {"text": text})
-                print("--- fin ---\n")
-            except Exception as e:
-                mcp_logger.log_response(corr, "remote-utils", "dns_lookup", "error", error=str(e))
-                print(f"(Error remoto dns_lookup: {e})")
-            continue
-
-        # ---------- Flujo normal con LLM ----------
-        memory.add_user(user_in)
-        messages = client.build_messages(
-            user_prompt=user_in,
-            system_prompt=system_prompt,
-            history=memory.get_history()[:-1],  # evita duplicar el último input del usuario
-        )
-        t0 = time.time()
         try:
-            answer = client.chat(messages, temperature=0.2)
+            line = input(">>> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not line:
+            continue
+
+        if line.lower() in {"/exit", "exit", "quit"}:
+            break
+        if line.lower() in {"/help", "help", "?"}:
+            print_banner()
+            continue
+
+        parts: List[str] = shlex.split(line)
+        cmd = parts[0].lower()
+
+        try:
+            if cmd == "/ph-info":
+                await cmd_ph_info()
+            elif cmd == "/ph-overview":
+                await cmd_ph_overview(parts[1])
+            elif cmd == "/ph-first":
+                await cmd_ph_first(parts[1])
+            elif cmd == "/ph-suspects":
+                await cmd_ph_suspects(parts[1])
+            elif cmd == "/ph-enrich":
+                await cmd_ph_enrich(parts[1])
+            elif cmd == "/ph-correlate":
+                await cmd_ph_correlate(parts[1])
+            else:
+                print("Comando no reconocido. Escribe /help para ver opciones.\n")
+        except IndexError:
+            print("Faltan argumentos. Escribe /help para ver el uso correcto.\n")
         except Exception as e:
-            answer = f"(Error al llamar al LLM: {e})"
-        dt_ms = int((time.time() - t0) * 1000)
+            print(f"Error: {e}\n")
 
-        memory.add_assistant(answer)
-
-        print("\n--- Respuesta ---")
-        print(answer)
-        print(f"\n({dt_ms} ms)\n")
-
-        _append_chat_log(chat_log_path, {
-            "t": _now(),
-            "user": user_in,
-            "assistant": answer,
-            "latency_ms": dt_ms,
-            "model": OPENROUTER_MODEL,
-        })
+def main() -> None:
+    if not PCAP_DIR.exists():
+        print(f"[Aviso] La carpeta de PCAP permitida no existe: {PCAP_DIR}", file=sys.stderr)
+        print("Cámbiala con PORT_HUNTER_ALLOWED_DIR en tu .env.\n", file=sys.stderr)
+    try:
+        asyncio.run(repl())
+    except KeyboardInterrupt:
+        pass
 
 if __name__ == "__main__":
-    run_chat_loop()
+    main()

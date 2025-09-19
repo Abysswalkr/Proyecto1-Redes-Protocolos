@@ -1,5 +1,12 @@
 pyproject.toml
 porthunter/server.py
+porthunter/stdio_server.py
+porthunter/utils/cache.py
+porthunter/utils/pcap.py
+porthunter/utils/intel/asn.py
+porthunter/utils/intel/geo.py
+porthunter/utils/intel/greynoise.py
+porthunter/utils/intel/otx.py
 porthunter_mcp.egg-info/PKG-INFO
 porthunter_mcp.egg-info/SOURCES.txt
 porthunter_mcp.egg-info/dependency_links.txt

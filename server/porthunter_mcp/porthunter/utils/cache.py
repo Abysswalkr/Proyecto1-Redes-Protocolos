@@ -6,7 +6,6 @@ from typing import Any, Optional
 class SimpleCache:
     """
     Caché JSON por llave (string) con TTL en segundos.
-    Archivo único junto al paquete -> _cache.json
     """
     def __init__(self, cache_file: Path, ttl_seconds: int = 7*24*3600) -> None:
         self.cache_file = cache_file

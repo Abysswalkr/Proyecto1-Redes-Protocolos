@@ -1,4 +1,3 @@
-# app/mcp/clients.py
 import asyncio
 import os
 from mcp.client.streamable_http import streamablehttp_client
@@ -39,7 +38,7 @@ def porthunter_params(
     )
 
 # ======================================================================
-# Ejecutor STDIO (común)
+# Ejecutor STDIO
 # ======================================================================
 
 async def _call_tool_async_stdio(
@@ -90,7 +89,6 @@ async def _call_tool_async_http(
     tool_name: str,
     arguments: Dict[str, Any],
 ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-    # Conectamos DIRECTO a la base (la app MCP está montada en "/")
     endpoint = base_url.rstrip("/")
     async with streamablehttp_client(endpoint) as (read, write, _session_id):
         async with ClientSession(read, write) as session:
@@ -142,10 +140,8 @@ def remote_call(
 
 def _normalize_endpoint(url: str) -> str:
     url = url.rstrip("/")
-    # Si el usuario pasó .../mcp/ o .../mcp lo dejamos tal cual
     if url.endswith("/mcp"):
         return url
-    # Si pasó la base (p. ej. http://127.0.0.1:8080), le agregamos /mcp
     return url + "/mcp"
 
 class RemoteMCPClient:
