@@ -8,14 +8,14 @@ from typing import Any, Dict, List, Optional
 class MCPLogger:
     """
     Logger JSONL de interacciones MCP (solicitudes y respuestas).
-    Escribe en logs/mcp/mcp-YYYYMMDD.jsonl por día.
+    Escribe en logs/mcp_local/mcp_local-YYYYMMDD.jsonl por día.
     """
-    def __init__(self, log_dir: str = "logs/mcp") -> None:
+    def __init__(self, log_dir: str = "logs/mcp_local") -> None:
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
     def _file_path(self) -> Path:
-        fname = f"mcp-{datetime.now().strftime('%Y%m%d')}.jsonl"
+        fname = f"mcp_local-{datetime.now().strftime('%Y%m%d')}.jsonl"
         return self.log_dir / fname
 
     def _write(self, obj: Dict[str, Any]) -> None:

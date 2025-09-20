@@ -1,21 +1,12 @@
 from pathlib import Path
 from typing import List, Dict, Any
 
-from app.mcp.logger import MCPLogger
-from app.mcp.clients import filesystem_params, git_params, call_tool
+from app.mcp_local.logger import MCPLogger
+from app.mcp_local.clients import filesystem_params, git_params, call_tool
 
 def run_demo_create_repo(base_dir: str = "mcp_demo_repo") -> List[str]:
-    """
-    Demostración Punto 4:
-      1) Filesystem.create_directory <base_dir>
-      2) Git.git_init <base_dir>
-      3) Filesystem.write_file <base_dir>/README.md
-      4) Git.git_add [<base_dir>/README.md]
-      5) Git.git_commit "Initial commit"
-    Devuelve un resumen de pasos ejecutados.
-    """
     out_lines: List[str] = []
-    logger = MCPLogger(log_dir="logs/mcp")
+    logger = MCPLogger(log_dir="logs/mcp_local")
 
     repo_path = Path(base_dir).resolve()
     fs_allowed = [str(repo_path.parent)]  # permitimos como mínimo el padre

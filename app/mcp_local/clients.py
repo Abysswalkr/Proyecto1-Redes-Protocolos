@@ -140,9 +140,9 @@ def remote_call(
 
 def _normalize_endpoint(url: str) -> str:
     url = url.rstrip("/")
-    if url.endswith("/mcp"):
+    if url.endswith("/mcp_local"):
         return url
-    return url + "/mcp"
+    return url + "/mcp_local"
 
 class RemoteMCPClient:
     def __init__(self, base_url: str):

@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 import pytest
-from ._mcp_client import call_tool, TOKEN
+from tests._mcp_client import call_tool, TOKEN
 
 @pytest.mark.asyncio
 async def test_overview_rejects_bad_extension(allowed_dir):

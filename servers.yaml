@@ -12,4 +12,4 @@ servers:
   # Git MCP (Python). Apunta a un repo existente o vacío.
   - name: git
     command: uvx
-    args: ["mcp-server-git", "--repository", "./demo_repo"]
+    args: ["mcp_local-server-git", "--repository", "./demo_repo"]

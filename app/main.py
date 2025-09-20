@@ -5,7 +5,7 @@ import shlex
 import asyncio
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -40,18 +40,13 @@ SERVER_ENV: Dict[str, str] = {
 }
 
 # ===================== Cliente MCP (STDIO) =====================
+# Usa SIEMPRE el SDK oficial `mcp`, no tu paquete `mcp_local`.
 
-# Compatibilidad con distintas versiones del SDK:
-try:
-    from mcp.client.stdio import StdioServerParameters as _StdParams  # >= algunas versiones
-except ImportError:  # pragma: no cover
-    from mcp.client.stdio import StdioServerParams as _StdParams      # otras versiones
-try:
-    from mcp.client.stdio import connect_stdio as _connect_stdio
-except ImportError:  # pragma: no cover
-    from mcp.client.stdio import connect as _connect_stdio
+from mcp import StdioServerParameters, types
+from mcp.client.stdio import stdio_client
+from mcp.client.session import ClientSession
 
-PORT_HUNTER = _StdParams(
+PORT_HUNTER = StdioServerParameters(
     command="python",
     args=["-m", "porthunter.server"],
     env=SERVER_ENV,
@@ -59,25 +54,35 @@ PORT_HUNTER = _StdParams(
 
 async def call_tool(name: str, arguments: Dict[str, Any], timeout_s: float = 120.0) -> Any:
     """
-    Abre una sesión STDIO con el server MCP, llama una tool y devuelve el primer content útil.
-    Cerramos la sesión tras cada comando para simplificar la vida.
+    Abre una sesión STDIO con el server MCP, llama una tool y devuelve el JSON si viene
+    en structuredContent; si no, devuelve el texto concatenado.
     """
-    async with await _connect_stdio(PORT_HUNTER) as (client, _proc):
-        coro = client.call_tool(name, arguments)
-        rsp = await asyncio.wait_for(coro, timeout=timeout_s)
-        if not rsp or not rsp.content:
+    async with stdio_client(PORT_HUNTER) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            rsp = await asyncio.wait_for(
+                session.call_tool(name, arguments=arguments),
+                timeout=timeout_s,
+            )
+
+            # 1) Si el SDK nos dio structuredContent (lo usual para "json"), úsalo.
+            sc = getattr(rsp, "structuredContent", None)
+            if isinstance(sc, dict):
+                return sc
+
+            # 2) Si vino en bloques de texto, concatenamos.
+            if rsp.content:
+                txt = ""
+                for block in rsp.content:
+                    if isinstance(block, types.TextContent):
+                        txt += block.text
+                if txt:
+                    try:
+                        return json.loads(txt)
+                    except Exception:
+                        return txt
+
             return None
-        # Normalizamos respuesta: priorizamos JSON, luego texto
-        for part in rsp.content:
-            t = getattr(part, "type", None)
-            if t == "json":
-                return part.data
-            if t == "text":
-                try:
-                    return json.loads(part.text)
-                except Exception:
-                    return part.text
-        return None
 
 # ===================== Helpers =====================
 
@@ -123,8 +128,13 @@ def print_banner() -> None:
 # ===================== Comandos (slash) =====================
 
 async def cmd_ph_tools() -> None:
-    data = await call_tool("tools/list", {})
-    pretty_print(data)
+    # list_tools no requiere token
+    async with stdio_client(PORT_HUNTER) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = await session.list_tools()
+            data = {"tools": [{"name": t.name, "description": t.description} for t in tools.tools]}
+            pretty_print(data)
 
 async def cmd_ph_info() -> None:
     data = await call_tool("get_info", {"auth_token": TOKEN})
@@ -161,50 +171,25 @@ async def cmd_ph_correlate(ips_csv: str) -> None:
 
 # ===================== Intents NL → Tools =====================
 
-# Patrones muy simples (ES) para lenguaje natural en terminal.
 RE_INFO = re.compile(r"^\s*(info|informaci[oó]n.*servidor)\s*$", re.IGNORECASE)
-RE_OVERVIEW = re.compile(
-    r"^\s*(analiza(r)?|an[aá]lisis|overview)\s+(.+?\.(?:pcapng|pcap))\s*$",
-    re.IGNORECASE,
-)
-RE_FIRST = re.compile(
-    r"^\s*(primer\s+evento(?:\s+de)?|first)\s+(.+?\.(?:pcapng|pcap))\s*$",
-    re.IGNORECASE,
-)
-RE_SUSPECTS = re.compile(
-    r"^\s*(sospechosos(?:\s+de)?|suspects)\s+(.+?\.(?:pcapng|pcap))(?:.*?\bpuertos?\s+(\d+))?(?:.*?\btasa\s+([0-9]+(?:\.[0-9]+)?))?\s*$",
-    re.IGNORECASE,
-)
-RE_ENRICH = re.compile(
-    r"^\s*(enriquece\s+ip|enrich)\s+([0-9a-fA-F:\.]+)\s*$",
-    re.IGNORECASE,
-)
-RE_CORRELATE = re.compile(
-    r"^\s*(correla(r)?|correlate)\s+(.+)$",
-    re.IGNORECASE,
-)
+RE_OVERVIEW = re.compile(r"^\s*(analiza(r)?|an[aá]lisis|overview)\s+(.+?\.(?:pcapng|pcap))\s*$", re.IGNORECASE)
+RE_FIRST = re.compile(r"^\s*(primer\s+evento(?:\s+de)?|first)\s+(.+?\.(?:pcapng|pcap))\s*$", re.IGNORECASE)
+RE_SUSPECTS = re.compile(r"^\s*(sospechosos(?:\s+de)?|suspects)\s+(.+?\.(?:pcapng|pcap))(?:.*?\bpuertos?\s+(\d+))?(?:.*?\btasa\s+([0-9]+(?:\.[0-9]+)?))?\s*$", re.IGNORECASE)
+RE_ENRICH = re.compile(r"^\s*(enriquece\s+ip|enrich)\s+([0-9a-fA-F:\.]+)\s*$", re.IGNORECASE)
+RE_CORRELATE = re.compile(r"^\s*(correla(r)?|correlate)\s+(.+)$", re.IGNORECASE)
 
 async def handle_natural_language(line: str) -> bool:
-    """
-    Intenta interpretar la línea como intención en lenguaje natural.
-    Devuelve True si ejecutó algo, False si no reconoció.
-    """
     m = RE_INFO.match(line)
     if m:
-        await cmd_ph_info()
-        return True
+        await cmd_ph_info(); return True
 
     m = RE_OVERVIEW.match(line)
     if m:
-        path = m.group(3).strip()
-        await cmd_ph_overview(path)
-        return True
+        await cmd_ph_overview(m.group(3).strip()); return True
 
     m = RE_FIRST.match(line)
     if m:
-        path = m.group(2).strip()
-        await cmd_ph_first(path)
-        return True
+        await cmd_ph_first(m.group(2).strip()); return True
 
     m = RE_SUSPECTS.match(line)
     if m:
@@ -216,15 +201,11 @@ async def handle_natural_language(line: str) -> bool:
 
     m = RE_ENRICH.match(line)
     if m:
-        ip = m.group(2).strip()
-        await cmd_ph_enrich(ip)
-        return True
+        await cmd_ph_enrich(m.group(2).strip()); return True
 
     m = RE_CORRELATE.match(line)
     if m:
-        ips_csv = m.group(3).strip()
-        await cmd_ph_correlate(ips_csv)
-        return True
+        await cmd_ph_correlate(m.group(3).strip()); return True
 
     return False
 
@@ -236,57 +217,42 @@ async def repl() -> None:
         try:
             line = input(">>> ").strip()
         except (EOFError, KeyboardInterrupt):
-            print()
-            break
+            print(); break
         if not line:
             continue
 
-        # Salidas/help
         low = line.lower()
         if low in {"/exit", "exit", "quit"}:
             break
         if low in {"/help", "help", "?"}:
-            print_banner()
-            continue
+            print_banner(); continue
 
-        # Primero intentamos slash-commands (compatibilidad 100%)
         parts: List[str] = shlex.split(line)
         cmd = parts[0].lower()
 
         try:
             if cmd == "/ph-tools":
-                await cmd_ph_tools()
-                continue
+                await cmd_ph_tools(); continue
             elif cmd == "/ph-info":
-                await cmd_ph_info()
-                continue
+                await cmd_ph_info(); continue
             elif cmd == "/ph-overview":
-                await cmd_ph_overview(parts[1])
-                continue
+                await cmd_ph_overview(parts[1]); continue
             elif cmd == "/ph-first":
-                await cmd_ph_first(parts[1])
-                continue
+                await cmd_ph_first(parts[1]); continue
             elif cmd == "/ph-suspects":
-                # parámetros opcionales: --min_ports N --min_rate R
                 path_arg = parts[1]
                 min_ports_val: Optional[int] = None
                 min_rate_val: Optional[float] = None
                 if "--min_ports" in parts:
-                    i = parts.index("--min_ports")
-                    min_ports_val = int(parts[i + 1])
+                    i = parts.index("--min_ports"); min_ports_val = int(parts[i + 1])
                 if "--min_rate" in parts:
-                    i = parts.index("--min_rate")
-                    min_rate_val = float(parts[i + 1])
-                await cmd_ph_suspects(path_arg, min_ports=min_ports_val, min_rate=min_rate_val)
-                continue
+                    i = parts.index("--min_rate"); min_rate_val = float(parts[i + 1])
+                await cmd_ph_suspects(path_arg, min_ports=min_ports_val, min_rate=min_rate_val); continue
             elif cmd == "/ph-enrich":
-                await cmd_ph_enrich(parts[1])
-                continue
+                await cmd_ph_enrich(parts[1]); continue
             elif cmd == "/ph-correlate":
-                await cmd_ph_correlate(parts[1])
-                continue
+                await cmd_ph_correlate(parts[1]); continue
 
-            # Si no fue comando, intentamos interpretar lenguaje natural:
             handled = await handle_natural_language(line)
             if not handled:
                 print("Comando no reconocido. Escribe /help para ver opciones.\n")

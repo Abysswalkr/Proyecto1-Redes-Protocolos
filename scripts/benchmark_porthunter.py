@@ -1,20 +1,14 @@
-#!/usr/bin/env python3
 import os
+import sys
 import time
 import json
 import asyncio
 from pathlib import Path
 from typing import Any, Dict
 
-# Reutilizamos la lógica del cliente MCP estilo main.py sin requerir UI
-try:
-    from mcp.client.stdio import StdioServerParameters as _StdParams
-except ImportError:
-    from mcp.client.stdio import StdioServerParams as _StdParams
-try:
-    from mcp.client.stdio import connect_stdio as _connect_stdio
-except ImportError:
-    from mcp.client.stdio import connect as _connect_stdio
+from mcp import StdioServerParameters, types
+from mcp.client.stdio import stdio_client
+from mcp.client.session import ClientSession
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_PCAP_DIR = ROOT_DIR / "captures"
@@ -34,26 +28,34 @@ SERVER_ENV = {
     "GEOLITE2_CITY_DB": os.getenv("GEOLITE2_CITY_DB") or os.getenv("GEOIP_DB_PATH", ""),
 }
 
-PORT_HUNTER = _StdParams(
-    command="python",
-    args=["-m", "porthunter.server"],
+PORT_HUNTER = StdioServerParameters(
+    command=sys.executable,
+    args=["-m", "porthunter.server"],   # <- lo mismo que usa tu CLI
     env=SERVER_ENV,
 )
 
-async def _call_tool(name: str, arguments: Dict[str, Any]) -> Any:
-    async with await _connect_stdio(PORT_HUNTER) as (client, _proc):
-        rsp = await client.call_tool(name, arguments)
-        if not rsp or not rsp.content:
+async def _call_tool(name: str, arguments: Dict[str, Any], timeout_s: float = 30.0) -> Any:
+    async with stdio_client(PORT_HUNTER) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            rsp = await asyncio.wait_for(
+                session.call_tool(name=name, arguments=arguments),
+                timeout=timeout_s,
+            )
+            sc = getattr(rsp, "structuredContent", None)
+            if isinstance(sc, dict):
+                return sc
+            if rsp.content:
+                txt = ""
+                for block in rsp.content:
+                    if isinstance(block, types.TextContent):
+                        txt += block.text
+                if txt:
+                    try:
+                        return json.loads(txt)
+                    except Exception:
+                        return txt
             return None
-        for part in rsp.content:
-            if getattr(part, "type", None) == "json":
-                return part.data
-            if getattr(part, "type", None) == "text":
-                try:
-                    return json.loads(part.text)
-                except Exception:
-                    return part.text
-        return None
 
 def _abs_pcap(path: str) -> str:
     p = Path(path)

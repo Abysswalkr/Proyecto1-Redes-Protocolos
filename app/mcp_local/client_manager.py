@@ -2,7 +2,7 @@ import subprocess
 import threading
 import json
 from typing import Dict, Any, Optional
-from app.mcp.logger import MCPLogger
+from app.mcp_local.logger import MCPLogger
 
 class MCPClientManager:
     """

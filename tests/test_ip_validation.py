@@ -1,5 +1,5 @@
 import pytest
-from ._mcp_client import call_tool, TOKEN
+from tests._mcp_client import call_tool, TOKEN
 
 @pytest.mark.asyncio
 async def test_enrich_rejects_invalid_ip():

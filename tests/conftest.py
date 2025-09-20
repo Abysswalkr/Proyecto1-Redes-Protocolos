@@ -1,7 +1,13 @@
+# tests/conftest.py
 import os
 import tempfile
 from pathlib import Path
 import pytest
+import sys
+
+TESTS = Path(__file__).resolve().parent
+if str(TESTS) not in sys.path:
+    sys.path.insert(0, str(TESTS))
 
 @pytest.fixture(scope="session", autouse=True)
 def _ensure_env():

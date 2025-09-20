@@ -41,13 +41,13 @@ async def lifespan(app):
     async with mcp.session_manager.run():
         yield
 
-# El endpoint real de MCP queda en "/mcp" por defecto.
+# El endpoint real de MCP queda en "/mcp_local" por defecto.
 asgi = Starlette(
     lifespan=lifespan,
     routes=[
         Route("/health", lambda request: PlainTextResponse("ok")),
         # Puedes exponer una vista de spec simple (opcional):
-        Route("/spec", lambda request: JSONResponse({"name": "remote-utils", "endpoint": "/mcp"})),
+        Route("/spec", lambda request: JSONResponse({"name": "remote-utils", "endpoint": "/mcp_local"})),
         Mount("/", app=mcp.streamable_http_app()),
     ],
 )
