@@ -4,6 +4,8 @@ import json
 import shlex
 import asyncio
 import re
+import asyncio
+from app.intent_router import route_message
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -83,6 +85,11 @@ async def call_tool(name: str, arguments: Dict[str, Any], timeout_s: float = 120
                         return txt
 
             return None
+
+async def handle_user_message(text: str):
+    kind, data = await route_message(text)
+    # Aquí formatea la salida (tarjeta/tabla). Por ahora imprime crudo:
+    print(kind.upper(), data)
 
 # ===================== Helpers =====================
 
@@ -271,4 +278,5 @@ def main() -> None:
         pass
 
 if __name__ == "__main__":
+    asyncio.run(handle_user_message("analiza captures\\scan-demo-20250906-1.pcapng"))
     main()

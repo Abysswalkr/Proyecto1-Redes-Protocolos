@@ -1,283 +1,259 @@
-import os, sys, json, shlex, subprocess, time
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+# app/cli.py
+# CLI para tu chatbot + cliente MCP que llama al servidor PortHunter por STDIO.
+# Autodetección del server: módulo instalado o script por ruta en server/porthunter_mcp/porthunter/.
+# Carga .env y añade auth_token automáticamente si existe PORT_HUNTER_TOKEN.
 
-# ------------ Config ------------
+import os
+import sys
+import argparse
+import asyncio
+import json
+import shlex
+from pathlib import Path
+from contextlib import AsyncExitStack
+from datetime import datetime, UTC
+import importlib.util
+
+# --- NUEVO: carga variables del .env si existe
 try:
-    from dotenv import load_dotenv  # opcional
+    from dotenv import load_dotenv  # pip install python-dotenv
     load_dotenv()
 except Exception:
     pass
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_PCAP_DIR = ROOT_DIR / "captures"
+# --- SDK MCP (cliente por STDIO)
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.shared.exceptions import McpError
 
-TOKEN: str = os.getenv("PORT_HUNTER_TOKEN", "MiTOKENultraSecreto123")
-PCAP_DIR: Path = Path(os.getenv("PORT_HUNTER_ALLOWED_DIR", str(DEFAULT_PCAP_DIR))).resolve()
+# ============ LOG ============
+LOG_PATH = Path("logs/mcp_interactions.jsonl")
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-ENV_BASE: Dict[str, str] = {
-    "PORT_HUNTER_TOKEN": TOKEN,
-    "PORT_HUNTER_ALLOWED_DIR": str(PCAP_DIR),
-    "PORT_HUNTER_ALLOW_PRIVATE": os.getenv("PORT_HUNTER_ALLOW_PRIVATE", "false"),
-    "PORT_HUNTER_CACHE_DIR": os.getenv("PORT_HUNTER_CACHE_DIR", ".cache/porthunter"),
-    "OTX_API_KEY": os.getenv("OTX_API_KEY", ""),
-    "GREYNOISE_API_KEY": os.getenv("GREYNOISE_API_KEY", ""),
-    "GEOLITE2_CITY_DB": os.getenv("GEOLITE2_CITY_DB") or os.getenv("GEOIP_DB_PATH", ""),
-    "PYTHONUNBUFFERED": "1",  # 🔧 fuerza flush en server
-}
+def _log_event(kind: str, payload: dict):
+    try:
+        with LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "t": datetime.now(UTC).isoformat(),
+                "kind": kind,
+                **payload
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
-PY_EXE = sys.executable
-SERVER_CMD = [PY_EXE, "-m", "porthunter.stdio_server"]
+# ============ RESOLUCIÓN DEL SERVIDOR ============
+CANDIDATE_MODULES = [
+    "porthunter.stdio_server",
+    "porthunter.server",
+    "server.porthunter_mcp.porthunter.stdio_server",
+    "server.porthunter_mcp.porthunter.server",
+]
 
-# ------------ Framing (LSP-like) ------------
-def _write_msg(fout, payload: Dict[str, Any]) -> None:
-    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    headers = (
-        f"Content-Length: {len(body)}\r\n"
-        f"Content-Type: application/json; charset=utf-8\r\n"
-        f"\r\n"
-    ).encode("ascii")
-    fout.write(headers)
-    fout.write(body)
-    fout.flush()
-
-def _read_until_header(fin, deadline: float) -> Optional[int]:
-    """
-    Lee byte a byte descartando ruido hasta encontrar un bloque de headers con Content-Length válido.
-    Devuelve el content-length, o None si vence el tiempo.
-    """
-    line = b""
-    headers: Dict[str, str] = {}
-    while time.time() < deadline:
-        bch = fin.read(1)
-        if not bch:
-            time.sleep(0.005)
-            continue
-        line += bch
-        # terminación de línea
-        if line.endswith(b"\r\n"):
-            s = line.decode("utf-8", "replace").strip("\r\n")
-            line = b""
-            if s == "":
-                # fin de headers
-                cl = headers.get("content-length")
-                if cl and cl.isdigit() and int(cl) >= 0:
-                    return int(cl)
-                # si no había Content-Length, reset y seguimos filtrando
-                headers = {}
-                continue
-            # parse header si tiene ':'
-            if ":" in s:
-                k, v = s.split(":", 1)
-                headers[k.strip().lower()] = v.strip()
-            else:
-                # ruido no-header → ignorar y seguimos leyendo
-                headers = {}
+def _find_importable_module() -> str | None:
+    for mod in CANDIDATE_MODULES:
+        if importlib.util.find_spec(mod):
+            return mod
     return None
 
-def _read_body(fin, nbytes: int, deadline: float) -> Optional[bytes]:
-    buf = b""
-    while len(buf) < nbytes and time.time() < deadline:
-        chunk = fin.read(nbytes - len(buf))
-        if not chunk:
-            time.sleep(0.005); continue
-        buf += chunk
-    return buf if len(buf) == nbytes else None
+def _find_script_path() -> Path | None:
+    repo_root = Path(__file__).resolve().parents[1]  # .../Proyecto1-Redes-Protocolos
+    candidates = [
+        repo_root / "server" / "porthunter_mcp" / "porthunter" / "stdio_server.py",
+        repo_root / "server" / "porthunter_mcp" / "porthunter" / "server.py",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
 
-def _rpc_once(method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 20.0) -> Any:
-    """
-    Lanza el server, hace la llamada JSON-RPC indicada y devuelve el 'result'.
-    Filtra cualquier salida extraña hasta ver un header válido.
-    Cierra el proceso al terminar.
-    """
-    env = os.environ.copy()
-    env.update(ENV_BASE)
-    proc = subprocess.Popen(
-        SERVER_CMD,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=None,      # deja stderr visible en la consola para tracebacks del server
-        env=env,
-        bufsize=0,        # I/O sin buffer (Windows)
+def _resolve_server_command() -> tuple[str, list[str]]:
+    env_cmd = os.getenv("PORTHUNTER_CMD")
+    env_args = os.getenv("PORTHUNTER_ARGS")
+    if env_cmd:
+        cmd = env_cmd
+        args = shlex.split(env_args) if env_args else []
+        return cmd, args
+
+    mod = _find_importable_module()
+    if mod:
+        return sys.executable, ["-m", mod]
+
+    script = _find_script_path()
+    if script:
+        return sys.executable, [str(script)]
+
+    raise RuntimeError(
+        "No encuentro el servidor PortHunter MCP.\n"
+        "Opciones:\n"
+        "  1) Instalar paquete:\n"
+        "       cd server/porthunter_mcp\n"
+        "       pip install -e .\n"
+        "  2) Forzar por variables de entorno:\n"
+        "       set PORTHUNTER_CMD=python\n"
+        "       set PORTHUNTER_ARGS=server\\porthunter_mcp\\porthunter\\stdio_server.py\n"
     )
-    try:
-        if not proc.stdin or not proc.stdout:
-            raise RuntimeError("No se pudieron abrir los pipes de STDIO.")
 
-        # Enviamos el request (sin initialize)
-        req_id = 1
-        req = {"jsonrpc": "2.0", "id": req_id, "method": method}
-        if params:
-            req["params"] = params
-        _write_msg(proc.stdin, req)
-
-        deadline = time.time() + timeout
-        # 1) buscar headers (saltando ruido)
-        clen = _read_until_header(proc.stdout, deadline)
-        if clen is None:
-            raise RuntimeError("Timeout esperando headers MCP (¿el server imprimió algo por stdout?).")
-
-        # 2) leer body
-        body = _read_body(proc.stdout, clen, deadline)
-        if body is None:
-            raise RuntimeError("Timeout leyendo body MCP.")
-        try:
-            resp = json.loads(body.decode("utf-8"))
-        except Exception:
-            raise RuntimeError("Body no es JSON válido (framing roto).")
-
-        # 3) validar respuesta
-        if resp.get("id") != req_id:
-            # si respondió algo previo (p.ej. a un request interno), intenta leer otro mensaje
-            clen2 = _read_until_header(proc.stdout, deadline)
-            if clen2 is None:
-                raise RuntimeError("No llegó respuesta al id esperado.")
-            body2 = _read_body(proc.stdout, clen2, deadline)
-            if body2 is None:
-                raise RuntimeError("Timeout leyendo body (2do mensaje).")
-            resp = json.loads(body2.decode("utf-8"))
-
-        if "error" in resp and resp["error"]:
-            raise RuntimeError(f"RPC error: {resp['error']}")
-        return resp.get("result")
-
-    finally:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=2)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-
-# ------------ API de alto nivel ------------
-def list_tools_names() -> List[str]:
-    res = _rpc_once("tools/list", {})
-    tools = res.get("tools") if isinstance(res, dict) else res
-    names: List[str] = []
-    if isinstance(tools, list):
-        for t in tools:
-            if isinstance(t, dict) and t.get("name"):
-                names.append(t["name"])
-    return names
-
-def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
-    tools = list_tools_names()
-    if name not in tools:
-        raise RuntimeError(f"La tool '{name}' no está publicada. Tools: {sorted(tools)}")
-    res = _rpc_once("tools/call", {"name": name, "arguments": arguments})
-    content = res.get("content") if isinstance(res, dict) else None
-    if isinstance(content, list):
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "json":
-                return part.get("data")
-            if isinstance(part, dict) and part.get("type") == "text":
-                txt = part.get("text", "")
-                try:
-                    return json.loads(txt)
-                except Exception:
-                    return txt
-    return res
-
-# ------------ Helpers CLI ------------
-def abs_pcap_path(arg_path: str) -> str:
-    p = Path(arg_path)
-    if not p.is_absolute():
-        p = (PCAP_DIR / p).resolve()
+# ============ UTILIDADES ============
+def _ensure_pcap_path(pcap: str) -> str:
+    p = Path(pcap).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"No encuentro el PCAP: {p}")
     return str(p)
 
-def pretty_print(obj: Any) -> None:
-    print("\n--- Respuesta ---")
-    try:
-        print(json.dumps(obj, indent=2, ensure_ascii=False))
-    except Exception:
-        print(obj)
-    print()
+# ============ CLIENTE MCP ============
+async def _call_porthunter_tool(tool_name: str, args: dict) -> dict:
+    """
+    Abre una sesión MCP via STDIO, lista herramientas y ejecuta la solicitada.
+    Inyecta auth_token si existe PORT_HUNTER_TOKEN.
+    """
+    cmd, cmd_args = _resolve_server_command()
 
-def print_banner() -> None:
-    print("MCP Chatbot – PortHunter (STDIO, JSON-RPC síncrono)")
-    print("Directorio de PCAP permitido:", PCAP_DIR)
-    print()
-    print("Comandos disponibles:")
-    print("  /ph-tools                    (listar tools del server)")
-    print("  /ph-info")
-    print("  /ph-overview <archivo.pcap|pcapng>")
-    print("  /ph-first <archivo.pcap|pcapng>")
-    print("  /ph-suspects <archivo.pcap|pcapng>")
-    print("  /ph-enrich <ip>")
-    print("  /ph-correlate <ip1,ip2,...>")
-    print("  /help")
-    print("  /exit")
-    print()
+    # --- NUEVO: añade el token al payload si existe
+    token = os.getenv("PORT_HUNTER_TOKEN")
+    if token and "auth_token" not in args:
+        args = {**args, "auth_token": token}
 
-# ------------ Comandos ------------
-def cmd_ph_tools() -> None:
-    pretty_print({"tools": list_tools_names()})
+    _log_event("connect_attempt", {
+        "server_command": cmd,
+        "server_args": cmd_args
+    })
 
-def cmd_ph_info() -> None:
-    pretty_print(call_tool("get_info", {"auth_token": TOKEN}))
+    # Pasamos todo el entorno actual (incluido PORT_HUNTER_TOKEN) al proceso hijo
+    server_params = StdioServerParameters(
+        command=cmd,
+        args=cmd_args,
+        env={"PYTHONUNBUFFERED": "1", **os.environ},
+    )
 
-def cmd_ph_overview(path_arg: str) -> None:
-    path = abs_pcap_path(path_arg)
-    pretty_print(call_tool("scan_overview", {"path": path, "auth_token": TOKEN}))
+    async with AsyncExitStack() as stack:
+        read, write = await stack.enter_async_context(stdio_client(server_params))
+        session = await stack.enter_async_context(ClientSession(read, write))
 
-def cmd_ph_first(path_arg: str) -> None:
-    path = abs_pcap_path(path_arg)
-    pretty_print(call_tool("first_scan_event", {"path": path, "auth_token": TOKEN}))
-
-def cmd_ph_suspects(path_arg: str) -> None:
-    path = abs_pcap_path(path_arg)
-    pretty_print(call_tool("list_suspects", {"path": path, "auth_token": TOKEN}))
-
-def cmd_ph_enrich(ip: str) -> None:
-    pretty_print(call_tool("enrich_ip", {"ip": ip, "auth_token": TOKEN}))
-
-def cmd_ph_correlate(ips_csv: str) -> None:
-    ips = [s.strip() for s in ips_csv.split(",") if s.strip()]
-    pretty_print(call_tool("correlate", {"ips": ips, "auth_token": TOKEN}))
-
-# ------------ Loop ------------
-def repl() -> None:
-    print_banner()
-    while True:
         try:
-            line = input(">>> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-        if not line:
-            continue
-        if line.lower() in {"/exit", "exit", "quit"}:
-            break
-        if line.lower() in {"/help", "help", "?"}:
-            print_banner(); continue
+            await session.initialize()
+        except McpError as e:
+            _log_event("initialize_error", {"error": str(e)})
+            raise RuntimeError(
+                "No se pudo inicializar la sesión MCP (Connection closed?).\n"
+                "Verifica ejecutando manualmente el server:\n"
+                f"    {cmd} {' '.join(cmd_args)}\n"
+                "Debe quedarse esperando (sin traza de error)."
+            ) from e
 
-        parts = shlex.split(line)
-        cmd = parts[0].lower()
+        tools_resp = await session.list_tools()
+        available = {t.name: t for t in tools_resp.tools}
+
+        if tool_name not in available:
+            _log_event("tool_missing", {"requested": tool_name, "available": list(available.keys())})
+            raise RuntimeError(
+                f"La herramienta '{tool_name}' no existe. Disponibles: {', '.join(available.keys()) or '(ninguna)'}"
+            )
+
+        _log_event("tool_call", {"tool": tool_name, "args": args})
+        result = await session.call_tool(tool_name, args)
+
+        payload = None
         try:
-            if cmd == "/ph-tools":       cmd_ph_tools()
-            elif cmd == "/ph-info":      cmd_ph_info()
-            elif cmd == "/ph-overview":  cmd_ph_overview(parts[1])
-            elif cmd == "/ph-first":     cmd_ph_first(parts[1])
-            elif cmd == "/ph-suspects":  cmd_ph_suspects(parts[1])
-            elif cmd == "/ph-enrich":    cmd_ph_enrich(parts[1])
-            elif cmd == "/ph-correlate": cmd_ph_correlate(parts[1])
-            else:
-                print("Comando no reconocido. Escribe /help.\n")
-        except IndexError:
-            print("Faltan argumentos. Escribe /help.\n")
-        except Exception as e:
-            print(f"Error: {e}\n")
+            if isinstance(result.content, list) and result.content and getattr(result.content[0], "type", None) == "text":
+                payload = json.loads(result.content[0].text)
+            elif getattr(result, "structured_content", None):
+                payload = result.structured_content  # por si tu lib lo expone así
+        except Exception:
+            payload = None
 
-def main() -> None:
-    if not PCAP_DIR.exists():
-        print(f"[Aviso] La carpeta de PCAP permitida no existe: {PCAP_DIR}", file=sys.stderr)
-        print("Cámbiala con PORT_HUNTER_ALLOWED_DIR en .env.\n", file=sys.stderr)
-    repl()
+        if payload is None:
+            payload = {
+                "raw": [
+                    {"type": getattr(c, "type", "unknown"),
+                     "text": getattr(c, "text", None),
+                     "data": getattr(c, "data", None)}
+                    for c in (result.content or [])
+                ]
+            }
+
+        _log_event("tool_result", {"tool": tool_name, "result_sample": str(payload)[:1000]})
+        return payload
+
+# ============ INTENTS ============
+def _parse_intent(user_text: str):
+    text = user_text.strip()
+
+    if text.lower().startswith("analiza "):
+        path = text[8:].strip().strip('"')
+        return {
+            "action": "scan_overview",
+            "args": {
+                "path": _ensure_pcap_path(path),
+                "time_window_s": 60,
+                "top_k": 20
+            }
+        }
+
+    if text.lower().startswith("sospechosos "):
+        path = text[len("sospechosos "):].strip().strip('"')
+        return {
+            "action": "list_suspects",
+            "args": {
+                "path": _ensure_pcap_path(path),
+                "min_ports": 10,
+                "min_rate_pps": 5
+            }
+        }
+
+    if text.lower().startswith("primer_evento "):
+        path = text[len("primer_evento "):].strip().strip('"')
+        return {
+            "action": "first_scan_event",
+            "args": {
+                "path": _ensure_pcap_path(path)
+            }
+        }
+
+    if text.lower().endswith(".pcap") or text.lower().endswith(".pcapng"):
+        return {
+            "action": "scan_overview",
+            "args": {
+                "path": _ensure_pcap_path(text),
+                "time_window_s": 60,
+                "top_k": 20
+            }
+        }
+
+    raise ValueError(
+        "No entendí el comando. Usa:\n"
+        "  analiza <ruta.pcap>\n"
+        "  sospechosos <ruta.pcap>\n"
+        "  primer_evento <ruta.pcap>\n"
+    )
+
+async def handle_user_text(user_text: str) -> str:
+    intent = _parse_intent(user_text)
+    data = await _call_porthunter_tool(intent["action"], intent["args"])
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+async def _once(text: str):
+    out = await handle_user_text(text)
+    print(out)
+
+def main():
+    parser = argparse.ArgumentParser(description="Chatbot de consola + cliente MCP para PortHunter")
+    parser.add_argument("--once", type=str, help='Ejecuta una sola consulta, p.ej.: --once "analiza .\\tiny.pcap"')
+    args = parser.parse_args()
+
+    if args.once:
+        asyncio.run(_once(args.once))
+    else:
+        print("MCP Chat (escribe 'salir' para terminar)")
+        try:
+            while True:
+                q = input("> ").strip()
+                if q.lower() in ("salir", "exit", "quit"):
+                    break
+                if not q:
+                    continue
+                asyncio.run(_once(q))
+        except (KeyboardInterrupt, EOFError):
+            pass
 
 if __name__ == "__main__":
     main()
