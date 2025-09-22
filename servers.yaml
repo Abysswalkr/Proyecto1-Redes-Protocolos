@@ -1,31 +1,12 @@
-servers:
-  - name: porthunter
-    command: python
-    args: ["porthunter_server.py"]
-
-  # Filesystem MCP (Node). Ajusta paths/flags
-  - name: filesystem
-    command: npx
-    args: ["-y", "@modelcontextprotocol/server-filesystem"]
-
-  # Git MCP (Python). Apunta a un repo existente o vacío.
-  - name: git
-    command: uvx
-    args: ["mcp_local-server-git", "--repository", "./demo_repo"]
-
-# --- Servidores MCP oficiales (por stdio) ---
 filesystem:
   transport: stdio
   command: npx
   args:
-    - -y
-    - @modelcontextprotocol/server-filesystem
-    - --root
-    - "C:/Users/joses/PycharmProjects/Proyecto1-Redes-Protocolos"
+    - "@modelcontextprotocol/server-filesystem"
 
 git:
   transport: stdio
-  command: npx
+  command: python
   args:
-    - -y
-    - @modelcontextprotocol/server-git
+    - -m
+    - mcp_server_git
