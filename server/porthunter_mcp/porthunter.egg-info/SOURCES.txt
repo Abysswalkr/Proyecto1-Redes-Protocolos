@@ -6,7 +6,10 @@ server/porthunter_mcp/porthunter.egg-info/dependency_links.txt
 server/porthunter_mcp/porthunter.egg-info/top_level.txt
 server/porthunter_mcp/porthunter/server.py
 server/porthunter_mcp/porthunter/stdio_server.py
+server/porthunter_mcp/porthunter.egg-info/PKG-INFO
 server/porthunter_mcp/porthunter.egg-info/SOURCES.txt
+server/porthunter_mcp/porthunter.egg-info/dependency_links.txt
+server/porthunter_mcp/porthunter.egg-info/top_level.txt
 server/porthunter_mcp/porthunter/utils/cache.py
 server/porthunter_mcp/porthunter/utils/pcap.py
 server/porthunter_mcp/porthunter/utils/intel/asn.py

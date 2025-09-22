@@ -9,7 +9,7 @@ def run_demo_create_repo(base_dir: str = "mcp_demo_repo") -> List[str]:
     logger = MCPLogger(log_dir="logs/mcp_local")
 
     repo_path = Path(base_dir).resolve()
-    fs_allowed = [str(repo_path.parent)]  # permitimos como mínimo el padre
+    fs_allowed = [str(repo_path.parent)]
 
     fs_params = filesystem_params(fs_allowed)
     git_srv   = git_params()

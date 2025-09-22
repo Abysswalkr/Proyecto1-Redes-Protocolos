@@ -3,8 +3,7 @@ import re
 from pathlib import Path
 from typing import Dict, Any, Optional
 
-from app.mcp_local.clients import stdio_client  # ya lo tienes
-from app.mcp_local.logger import log            # ya lo tienes
+from app.mcp_local.clients import stdio_client
 
 PORT_HUNTER_CMD = {"command": "python", "args": ["-m", "porthunter.server"], "env": {}}
 

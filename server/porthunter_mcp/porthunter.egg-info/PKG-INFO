@@ -2,7 +2,7 @@ Metadata-Version: 2.4
 Name: porthunter
 Version: 0.1.0
 Summary: PortHunter MCP (stdio) + CLI integrados para análisis de PCAP
-Author: Tu Nombre
+Author: José Gramajo
 License: MIT
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
@@ -294,7 +294,7 @@ Para ver el log MCP reciente:
 
 ```bash
 python -m app.main
-/mcp-log
+/mcp_local-log
 ```
 
 O abrir manualmente el archivo del día con tu editor.

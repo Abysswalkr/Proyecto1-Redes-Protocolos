@@ -1,12 +1,15 @@
 filesystem:
   transport: stdio
-  command: npx
+  command: "C:\\Program Files\\nodejs\\npm.cmd"
   args:
+    - "exec"
+    - "--yes"
     - "@modelcontextprotocol/server-filesystem"
+    - "C:\\Users\\joses\\PycharmProjects\\Proyecto1-Redes-Protocolos"
 
 git:
   transport: stdio
-  command: python
+  command: "python"
   args:
-    - -m
-    - mcp_server_git
+    - "-m"
+    - "mcp_server_git"

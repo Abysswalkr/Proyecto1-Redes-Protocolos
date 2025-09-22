@@ -1,4 +1,3 @@
-# app/mcp_porthunter.py
 import os
 import sys
 import json
