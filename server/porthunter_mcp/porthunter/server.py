@@ -6,35 +6,39 @@ import json
 import logging
 import inspect
 from pathlib import Path
-from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from ipaddress import ip_address, ip_network
+from datetime import datetime, timezone
 
 from mcp.server.fastmcp import FastMCP
 
-# Utils del proyecto
-from .utils.pcap import analyze_pcap   # devuelve (overview, first_event)
+# Utilidades que ya tienes en el paquete porthunter
+from .utils.pcap import analyze_pcap
 from .utils.cache import SimpleCache
 from .utils.intel.otx import otx_enrich
 from .utils.intel.greynoise import greynoise_enrich
 from .utils.intel.asn import asn_lookup
 from .utils.intel.geo import geo_lookup
 
+# ⬅️ AHORA importamos desde el MISMO paquete (un punto)
+from .utils_path import ensure_allowed_path, PathOutsideAllowedDir
+from . import config
+
 # ------------ Logging ------------
 log = logging.getLogger("porthunter.server")
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
 APP_NAME = "PortHunter"
+
+# Seguridad
 ENV_TOKEN = os.getenv("PORT_HUNTER_TOKEN", "")
 REQUIRE_TOKEN = os.getenv("PORT_HUNTER_REQUIRE_TOKEN", "true").lower() == "true"
 ALLOW_PRIVATE = os.getenv("PORT_HUNTER_ALLOW_PRIVATE", "false").lower() == "true"
 
-ALLOWED_DIR = Path(os.getenv("PORT_HUNTER_ALLOWED_DIR", ".")).resolve()
+# Cache
 CACHE_DIR = Path(os.getenv("PORT_HUNTER_CACHE_DIR", ".cache/porthunter")).resolve()
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_FILE = CACHE_DIR / "cache.json"
-
-# ✅ Path (no str) para el cache
 cache = SimpleCache(CACHE_FILE)
 
 # Redes privadas
@@ -49,17 +53,17 @@ _PRIVATE_NETS = [
     ip_network("fe80::/10"),
 ]
 
+# ------------ Helpers ------------
+
 def _now() -> str:
-    # Evita el warning de utcnow() con un datetime aware
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 def _is_private_ip(ip: str) -> bool:
-    """True sólo si es privada. Si no es IP válida, NO decide aquí."""
     try:
         addr = ip_address(ip)
         return any(addr in net for net in _PRIVATE_NETS)
     except Exception:
-        return False  # inválida ≠ privada
+        return False
 
 def _is_invalid_ip(ip: str) -> bool:
     try:
@@ -74,35 +78,32 @@ def _require_token(auth_token: Optional[str]) -> None:
     if auth_token != ENV_TOKEN:
         raise PermissionError("authentication_required")
 
-def _sanitize_path(path: str) -> Path:
-    p = (Path(path).expanduser()).resolve()
-    if not str(p).startswith(str(ALLOWED_DIR)):
-        raise ValueError("path_outside_allowed_dir")
+def _sanitize_pcap_path(user_path: str | Path) -> Path:
+    """
+    1) Asegura que la ruta esté bajo carpetas permitidas (por defecto <repo>/captures).
+    2) Verifica existencia, tipo de archivo, extensión y tamaño.
+    """
+    p = ensure_allowed_path(user_path)  # lanza PathOutsideAllowedDir si está fuera
+
     if not p.exists():
         raise FileNotFoundError("path_not_found")
     if not p.is_file():
         raise ValueError("path_not_a_file")
     if p.suffix.lower() not in {".pcap", ".pcapng"}:
         raise ValueError("unsupported_file_type")
+
     max_mb = float(os.getenv("PORT_HUNTER_MAX_PCAP_MB", "50"))
     size_mb = p.stat().st_size / (1024 * 1024)
     if size_mb > max_mb:
         raise ValueError("path_file_too_large")
+
     return p
 
 def _safe_enrich_ip(ip: str) -> Dict[str, Any]:
-    # 1) inválida -> invalid_ip
     if _is_invalid_ip(ip):
         return {"ip": ip, "ok": False, "error": "invalid_ip", "generated_at": _now()}
-
-    # 2) privada -> skipped (salvo ALLOW_PRIVATE=true)
     if _is_private_ip(ip) and not ALLOW_PRIVATE:
-        return {
-            "ip": ip,
-            "skipped": True,
-            "reason": "private_ip",
-            "generated_at": _now(),
-        }
+        return {"ip": ip, "skipped": True, "reason": "private_ip", "generated_at": _now()}
 
     otx_key = os.getenv("OTX_API_KEY")
     gn_key = os.getenv("GREYNOISE_API_KEY")
@@ -121,16 +122,15 @@ def _safe_enrich_ip(ip: str) -> Dict[str, Any]:
     cache.set(cache_key, out)
     return out
 
-# ------------ App MCP (Tools) ------------
-app = FastMCP(APP_NAME)
-
 def _json(data: Dict[str, Any]) -> str:
-    """Devuelve JSON plano (str). Los tests lo esperan en toplevel."""
     return json.dumps(data, ensure_ascii=False)
+
+# ------------ App MCP (Tools) ------------
+
+app = FastMCP(APP_NAME)
 
 @app.tool()
 def get_info(auth_token: Optional[str] = None) -> str:
-    """Estado del servidor y políticas."""
     try:
         _require_token(auth_token)
         payload = {
@@ -140,9 +140,9 @@ def get_info(auth_token: Optional[str] = None) -> str:
             "capabilities": {"tools": True},
             "secure_mode": bool(ENV_TOKEN),
             "allow_private": ALLOW_PRIVATE,
-            "allowed_dir": str(ALLOWED_DIR),
+            "allowed_dirs": [str(p) for p in config.ALLOWED_READ_DIRS],
+            "captures_dir": str(config.CAPTURES_DIR),
             "cache_file": str(CACHE_FILE),
-            "ttl_days": getattr(cache, "ttl_days", None),
             "generated_at": _now(),
         }
     except PermissionError as e:
@@ -156,18 +156,20 @@ def scan_overview(
     top_k: int = 20,
     auth_token: Optional[str] = None,
 ) -> str:
-    """Resumen general de un PCAP (seguro)."""
     try:
         _require_token(auth_token)
-        p = _sanitize_path(path)
+        try:
+            p = _sanitize_pcap_path(path)
+        except PathOutsideAllowedDir:
+            return _json({"ok": False, "error": "path_outside_allowed_dir", "generated_at": _now()})
 
-        # “A prueba de parser”: si falla o está vacío, overview mínimo ok=True
         try:
             if p.stat().st_size == 0:
                 raise RuntimeError("empty_file")
             overview, _fe = analyze_pcap(str(p), time_window_s=time_window_s, top_k=top_k)
             payload = {"ok": True, "overview": overview, "generated_at": _now()}
         except Exception as parse_err:
+            # Respuesta mínima si el parser falla, para que el smoke no reviente
             minimal = {
                 "file": str(p),
                 "note": f"parse_skipped:{parse_err}",
@@ -175,11 +177,8 @@ def scan_overview(
                 "generated_at": _now(),
             }
             payload = {"ok": True, "overview": minimal, "generated_at": _now()}
-
     except Exception as e:
-        # Sólo errores de política/ruta deben ser ok=False
         payload = {"ok": False, "error": str(e), "generated_at": _now()}
-
     return _json(payload)
 
 @app.tool()
@@ -189,16 +188,17 @@ def list_suspects(
     min_rate_pps: float = 5.0,
     auth_token: Optional[str] = None,
 ) -> str:
-    """Umbrales simples para listar sospechosos."""
     try:
         _require_token(auth_token)
-        p = _sanitize_path(path)
+        try:
+            p = _sanitize_pcap_path(path)
+        except PathOutsideAllowedDir:
+            return _json({"ok": False, "error": "path_outside_allowed_dir", "generated_at": _now()})
+
         try:
             overview, _ = analyze_pcap(str(p), time_window_s=60, top_k=200)
         except Exception:
-            # Si no se pudo parsear, no hay sospechosos.
-            payload = {"ok": True, "suspects": [], "generated_at": _now()}
-            return _json(payload)
+            return _json({"ok": True, "suspects": [], "generated_at": _now()})
 
         interval = max(1, int(overview.get("interval_s", 0)) or 1)
         suspects: List[Dict[str, Any]] = []
@@ -232,15 +232,17 @@ def list_suspects(
 
 @app.tool()
 def first_scan_event(path: str, auth_token: Optional[str] = None) -> str:
-    """Primer evento significativo."""
     try:
         _require_token(auth_token)
-        p = _sanitize_path(path)
+        try:
+            p = _sanitize_pcap_path(path)
+        except PathOutsideAllowedDir:
+            return _json({"ok": False, "error": "path_outside_allowed_dir", "generated_at": _now()})
+
         try:
             _, fe = analyze_pcap(str(p), time_window_s=60, top_k=50)
             payload = {"ok": True, "first_event": fe, "generated_at": _now()}
         except Exception:
-            # Si no se puede parsear, no hay evento
             payload = {"ok": True, "first_event": None, "generated_at": _now()}
     except Exception as e:
         log.exception("first_scan_event error")
@@ -249,7 +251,6 @@ def first_scan_event(path: str, auth_token: Optional[str] = None) -> str:
 
 @app.tool()
 def enrich_ip(ip: str, auth_token: Optional[str] = None) -> str:
-    """Valida/enriquece una IP según políticas."""
     try:
         _require_token(auth_token)
         enr = _safe_enrich_ip(ip)
@@ -263,12 +264,6 @@ def enrich_ip(ip: str, auth_token: Optional[str] = None) -> str:
 
 @app.tool()
 def correlate(ips: List[str], auth_token: Optional[str] = None) -> str:
-    """
-    Reglas que piden los tests:
-    - inválida -> {"ip":..., "ok": False, "error": "invalid_ip"}
-    - privada  -> {"ip":..., "skipped": True, "reason": "private_ip"}
-    - pública  -> {"ip":..., "ok": True, "kind": "public"}
-    """
     try:
         _require_token(auth_token)
         out: List[Dict[str, Any]] = []
@@ -285,28 +280,16 @@ def correlate(ips: List[str], auth_token: Optional[str] = None) -> str:
         payload = {"ok": False, "error": str(e), "generated_at": _now()}
     return _json(payload)
 
-# ------------ Main (STDIO agnóstico de versión) ------------
+# ------------ Main (runner STDIO tolerante a versiones) ------------
+
 def _run_stdio_app(app: FastMCP) -> int:
-    """
-    Arranca la app por STDIO probando distintos nombres de método que
-    existen en versiones diferentes del paquete `mcp`.
-    """
     try:
         import anyio
     except Exception as e:
         log.error("Falta dependencia 'anyio': %s", e)
         return 2
 
-    # Candidatos de métodos en el objeto app (distintas versiones)
-    candidate_methods = [
-        "serve",          # algunas versiones
-        "run",            # otras versiones
-        "serve_stdio",    # variantes
-        "run_stdio",      # variantes
-        "start",          # por si acaso
-        "start_stdio",    # por si acaso
-    ]
-
+    candidate_methods = ["serve", "run", "serve_stdio", "run_stdio", "start", "start_stdio"]
     for name in candidate_methods:
         meth = getattr(app, name, None)
         if not meth:
@@ -315,19 +298,14 @@ def _run_stdio_app(app: FastMCP) -> int:
             if inspect.iscoroutinefunction(meth):
                 anyio.run(meth)
                 return 0
-            # si no es coroutine function, puede devolver coroutine
-            result = meth()
-            if inspect.iscoroutine(result):
-                anyio.run(lambda: result)  # ejecutar la coroutine devuelta
+            res = meth()
+            if inspect.iscoroutine(res):
+                anyio.run(lambda: res)
             return 0
         except Exception as e:
             log.error("Fallo al invocar app.%s: %s", name, e)
 
-    log.error(
-        "No se encontró un método de arranque compatible en FastMCP. "
-        "Actualiza el paquete 'mcp' a una versión que provea un runner "
-        "por STDIO (app.run/app.serve/app.run_stdio)."
-    )
+    log.error("No se encontró un método de arranque compatible en FastMCP.")
     return 2
 
 if __name__ == "__main__":
