@@ -5,6 +5,7 @@ import sys
 import json
 import logging
 import inspect
+import runpy
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from ipaddress import ip_address, ip_network
@@ -308,5 +309,11 @@ def _run_stdio_app(app: FastMCP) -> int:
     log.error("No se encontró un método de arranque compatible en FastMCP.")
     return 2
 
+def main() -> None:
+    # Arranca el servidor MCP por STDIO
+    code = _run_stdio_app(app)
+    if code:
+        raise SystemExit(code)
+
 if __name__ == "__main__":
-    sys.exit(_run_stdio_app(app))
+    main()
