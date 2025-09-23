@@ -1,0 +1,33 @@
+No.     Time                          Source                Destination           Protocol TCP Segment Len Info
+    444 2025-09-17 09:31:52.974074    127.0.0.1             127.0.0.1             HTTP     5               HTTP/1.1 200 OK  (text/event-stream)
+
+Frame 444: 49 bytes on wire (392 bits), 49 bytes captured (392 bits) on interface \Device\NPF_Loopback, id 0
+Null/Loopback
+Internet Protocol Version 4, Src: 127.0.0.1, Dst: 127.0.0.1
+Transmission Control Protocol, Src Port: 8080, Dst Port: 52331, Seq: 440, Ack: 357, Len: 5
+    Source Port: 8080
+    Destination Port: 52331
+    [Stream index: 22]
+    [Stream Packet Number: 12]
+    [Conversation completeness: Complete, WITH_DATA (31)]
+    [TCP Segment Len: 5]
+    Sequence Number: 440    (relative sequence number)
+    Sequence Number (raw): 2584239630
+    [Next Sequence Number: 445    (relative sequence number)]
+    Acknowledgment Number: 357    (relative ack number)
+    Acknowledgment number (raw): 2032968874
+    0101 .... = Header Length: 20 bytes (5)
+    Flags: 0x018 (PSH, ACK)
+    Window: 254
+    [Calculated window size: 65024]
+    [Window size scaling factor: 256]
+    Checksum: 0x6ac3 [unverified]
+    [Checksum Status: Unverified]
+    Urgent Pointer: 0
+    [Timestamps]
+    [SEQ/ACK analysis]
+    TCP payload (5 bytes)
+    TCP segment data (5 bytes)
+[3 Reassembled TCP Segments (444 bytes): #440(220), #442(219), #444(5)]
+Hypertext Transfer Protocol, has 2 chunks (including last chunk)
+Media Type
