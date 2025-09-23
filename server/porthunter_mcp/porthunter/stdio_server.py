@@ -10,6 +10,9 @@ import re
 from datetime import datetime, UTC
 from ipaddress import ip_address, ip_network
 
+# -----------------------------------------------------------------------------
+# Logging SOLO a STDERR (stdout es exclusivo del protocolo MCP/JSON-RPC)
+# -----------------------------------------------------------------------------
 logging.basicConfig(
     level=os.getenv("PORT_HUNTER_LOG_LEVEL", "WARNING"),
     stream=sys.stderr,
@@ -21,6 +24,7 @@ APP_NAME = "PortHunter MCP (stdio)"
 ENV_TOKEN = os.getenv("PORT_HUNTER_TOKEN")
 ALLOWED_DIR = Path(os.getenv("PORT_HUNTER_ALLOWED_DIR", ".")).resolve()
 ALLOW_PRIVATE = os.getenv("PORT_HUNTER_ALLOW_PRIVATE", "false").lower() in {"1", "true", "yes"}
+
 CACHE_DIR = Path(os.getenv("PORT_HUNTER_CACHE_DIR", ".cache/porthunter")).resolve()
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 try:
@@ -28,6 +32,7 @@ try:
 except Exception:
     _ttl_days = 7
 
+# === Utils del proyecto (sin cambios de negocio)
 from .utils.pcap import analyze_pcap   # devuelve (overview, first_event)
 from .utils.cache import SimpleCache
 from .utils.intel.otx import otx_enrich
@@ -38,12 +43,11 @@ from .utils.intel.geo import geo_lookup
 CACHE_FILE = CACHE_DIR / "intel_cache.json"
 cache = SimpleCache(CACHE_FILE, ttl_seconds=_ttl_days * 24 * 3600)
 
-# --- NUEVOS límites y banderas de seguridad (configurables por .env) ---
+# --- políticas / límites (config por .env)
 REQUIRE_TOKEN = os.getenv("PORT_HUNTER_REQUIRE_TOKEN", "true").lower() in {"1", "true", "yes"}
-MAX_PCAP_MB   = int(os.getenv("PORT_HUNTER_MAX_PCAP_MB", "200"))  # tamaño duro por archivo
+MAX_PCAP_MB   = int(os.getenv("PORT_HUNTER_MAX_PCAP_MB", "200"))
 ALLOWED_EXTS  = {".pcap", ".pcapng"}
 IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
-# -----------------------------------------------------------------------
 
 _PRIVATE_NETS = [
     ip_network("10.0.0.0/8"),
@@ -56,9 +60,8 @@ _PRIVATE_NETS = [
     ip_network("fe80::/10"),
 ]
 
-# --- reemplazada (igual forma pero explícita) ---
 def _now() -> str:
-    return datetime.now(UTC).isoformat()  # timezone-aware, sin warning
+    return datetime.now(UTC).isoformat()
 
 def _is_private_ip(ip: str) -> bool:
     try:
@@ -67,20 +70,15 @@ def _is_private_ip(ip: str) -> bool:
     except Exception:
         return True
 
-# --- helper nuevo: validar IP (v4/v6) ---
 def _is_valid_ip(ip: str) -> bool:
     try:
-        ip_address(ip)  # acepta v4/v6
+        ip_address(ip)
         return True
     except Exception:
         return False
 
-# --- reemplazada: ahora respeta REQUIRE_TOKEN y valida configuración ---
 def _require_token(auth: Optional[str]) -> None:
-    """
-    Si REQUIRE_TOKEN=true, rechaza todas las llamadas sin un token que
-    coincida con PORT_HUNTER_TOKEN.
-    """
+    """Si se habilita REQUIRE_TOKEN, exige que auth coincida con PORT_HUNTER_TOKEN."""
     if not REQUIRE_TOKEN:
         return
     if not ENV_TOKEN:
@@ -88,13 +86,8 @@ def _require_token(auth: Optional[str]) -> None:
     if auth != ENV_TOKEN:
         raise PermissionError("authentication_required")
 
-# --- reemplazada: ahora fuerza extensión válida y tamaño máximo ---
 def _sanitize_path(path: str) -> Path:
-    """
-    1) normaliza y restringe a ALLOWED_DIR
-    2) obliga a extensión permitida
-    3) limita tamaño de archivo (MAX_PCAP_MB)
-    """
+    """Normaliza, restringe a ALLOWED_DIR, fuerza extensión válida y tamaño máximo."""
     p = (Path(path).expanduser()).resolve()
     if not str(p).startswith(str(ALLOWED_DIR)):
         raise ValueError("path_outside_allowed_dir")
@@ -104,10 +97,7 @@ def _sanitize_path(path: str) -> Path:
         raise ValueError("path_not_a_file")
     if p.suffix.lower() not in ALLOWED_EXTS:
         raise ValueError("unsupported_file_type")
-    try:
-        size_mb = p.stat().st_size / (1024 * 1024)
-    except Exception:
-        size_mb = MAX_PCAP_MB + 1  # fuerza rechazo si falla
+    size_mb = p.stat().st_size / (1024 * 1024)
     if size_mb > MAX_PCAP_MB:
         raise ValueError(f"file_too_large:{int(size_mb)}MB>{MAX_PCAP_MB}MB")
     return p
@@ -133,68 +123,122 @@ def _safe_enrich_ip(ip: str) -> Dict[str, Any]:
     cache.set(cache_key, out)
     return out
 
-# ---------- Framing JSON-RPC (LSP-like) ----------
-def _read_headers(fin) -> Dict[str, str]:
-    headers: Dict[str, str] = {}
-    line = b""
-    while True:
-        ch = fin.read(1)
-        if not ch:
-            return {}
-        line += ch
-        if line.endswith(b"\r\n"):
-            s = line.decode("utf-8", "replace").strip("\r\n")
-            line = b""
-            if s == "":
-                return headers
-            if ":" in s:
-                k, v = s.split(":", 1)
-                headers[k.strip().lower()] = v.strip()
-
-def _read_msg(fin) -> Optional[Dict[str, Any]]:
-    headers = _read_headers(fin)
-    if not headers:
+# =============================================================================
+#  STDIO framing para MCP: **UNA LÍNEA JSON POR MENSAJE** (sin Content-Length)
+# =============================================================================
+def _read_msg_line(fin) -> Optional[Dict[str, Any]]:
+    """
+    Lee una línea UTF-8 de stdin y la parsea como JSON.
+    La spec indica que cada mensaje es un JSON *en una sola línea* separado por '\n'.
+    """
+    line = fin.readline()
+    if not line:
         return None
     try:
-        clen = int(headers.get("content-length", "0"))
-    except Exception:
-        return None
-    if clen <= 0:
-        return None
-    body = fin.read(clen)
-    if not body:
-        return None
-    try:
-        return json.loads(body.decode("utf-8"))
-    except Exception:
+        s = line.decode("utf-8").rstrip("\r\n").strip()
+        if not s:
+            return None
+        return json.loads(s)
+    except Exception as e:
+        log.error("Línea JSON inválida (ignorada): %r (%s)", line, e)
         return None
 
-def _write_msg(fout, payload: Dict[str, Any]) -> None:
-    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    header = (
-        f"Content-Length: {len(body)}\r\n"
-        f"Content-Type: application/json; charset=utf-8\r\n"
-        f"\r\n"
-    ).encode("ascii")
-    fout.write(header)
-    fout.write(body)
+def _write_msg_line(fout, payload: Dict[str, Any]) -> None:
+    """
+    Escribe el payload como una *única* línea JSON (sin newlines embebidos).
+    """
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    # Seguridad adicional: por si acaso alguien mete '\n' en texto, lo colapsamos.
+    body = body.replace("\r", " ").replace("\n", " ")
+    fout.write((body + "\n").encode("utf-8"))
     fout.flush()
 
-# ---------- Tools ----------
+# =============================================================================
+#  Tools (definición)
+# =============================================================================
+def _tool_def(name: str, description: str, properties: Dict[str, Any] | None = None, required: List[str] | None = None):
+    return {
+        "name": name,
+        "description": description,
+        "inputSchema": {
+            "type": "object",
+            "properties": properties or {},
+            "required": required or [],
+        },
+    }
+
 TOOLS_SPEC = [
-    {"name": "get_info", "description": "Estado del servidor PortHunter y capacidades."},
-    {"name": "scan_overview", "description": "Resumen de actividad (scanners, puertos, targets)."},
-    {"name": "first_scan_event", "description": "Primer evento de escaneo detectado en el PCAP."},
-    {"name": "list_suspects", "description": "Lista de IPs sospechosas por umbrales básicos."},
-    {"name": "enrich_ip", "description": "Enriquecimiento OTX, GreyNoise, ASN, Geo de una IP."},
-    {"name": "correlate", "description": "Puntaje simple 0–100 por IP a partir de enriquecimientos."},
+    _tool_def(
+        "get_info",
+        "Estado del servidor PortHunter y capacidades.",
+        {"auth_token": {"type": "string", "description": "Token de autenticación (si se requiere)"}},
+    ),
+    _tool_def(
+        "scan_overview",
+        "Resumen de actividad (scanners, puertos, targets) para un PCAP.",
+        {
+            "path": {"type": "string", "description": "Ruta del archivo .pcap o .pcapng"},
+            "time_window_s": {"type": "integer", "description": "Ventana temporal para agrupación", "default": 60},
+            "top_k": {"type": "integer", "description": "Top K resultados", "default": 20},
+            "auth_token": {"type": "string"},
+        },
+        required=["path"],
+    ),
+    _tool_def(
+        "first_scan_event",
+        "Primer evento de escaneo detectado en el PCAP.",
+        {
+            "path": {"type": "string", "description": "Ruta del archivo .pcap o .pcapng"},
+            "auth_token": {"type": "string"},
+        },
+        required=["path"],
+    ),
+    _tool_def(
+        "list_suspects",
+        "IPs sospechosas por umbrales básicos.",
+        {
+            "path": {"type": "string"},
+            "min_ports": {"type": "integer", "default": 2},
+            "min_rate_pps": {"type": "number", "default": 1.0},
+            "auth_token": {"type": "string"},
+        },
+        required=["path"],
+    ),
+    _tool_def(
+        "enrich_ip",
+        "Enriquecimiento OTX, GreyNoise, ASN, Geo de una IP.",
+        {"ip": {"type": "string"}, "auth_token": {"type": "string"}},
+        required=["ip"],
+    ),
+    _tool_def(
+        "correlate",
+        "Puntaje simple 0–100 por IP a partir de enriquecimientos.",
+        {"ips": {"type": "array", "items": {"type": "string"}}, "auth_token": {"type": "string"}},
+        required=["ips"],
+    ),
 ]
+
+# =============================================================================
+#  Handlers JSON-RPC
+# =============================================================================
+def _ok_text_and_struct(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Devuelve ambos formatos:
+    - content: bloque 'text' con el JSON serializado (compatible universal)
+    - structuredContent: el mismo JSON como objeto (para clientes que lo lean tipado)
+    """
+    return {
+        "content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}],
+        "structuredContent": data,
+    }
 
 def _handle_initialize(params: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "protocolVersion": "2025-06-18",
         "serverInfo": {"name": APP_NAME, "version": "1.0"},
-        "capabilities": {"tools": True},
+        "capabilities": {
+            "tools": {},  # <-- Debe ser objeto (no boolean)
+        },
     }
 
 def _handle_tools_list(params: Dict[str, Any]) -> Dict[str, Any]:
@@ -211,7 +255,7 @@ def _handle_tools_call(params: Dict[str, Any]) -> Dict[str, Any]:
                 "ok": True,
                 "serverInfo": {"name": APP_NAME, "version": "1.0"},
                 "protocolVersion": "2025-06-18",
-                "capabilities": {"tools": True},
+                "capabilities": {"tools": {}},
                 "secure_mode": bool(ENV_TOKEN),
                 "allow_private": ALLOW_PRIVATE,
                 "allowed_dir": str(ALLOWED_DIR),
@@ -221,7 +265,7 @@ def _handle_tools_call(params: Dict[str, Any]) -> Dict[str, Any]:
             }
         except PermissionError as e:
             data = {"ok": False, "error": str(e), "generated_at": _now()}
-        return {"content": [{"type": "json", "data": data}]}
+        return _ok_text_and_struct(data)
 
     if name == "scan_overview":
         try:
@@ -234,7 +278,7 @@ def _handle_tools_call(params: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             log.exception("scan_overview error")
             data = {"ok": False, "error": str(e), "generated_at": _now()}
-        return {"content": [{"type": "json", "data": data}]}
+        return _ok_text_and_struct(data)
 
     if name == "first_scan_event":
         try:
@@ -245,7 +289,7 @@ def _handle_tools_call(params: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             log.exception("first_scan_event error")
             data = {"ok": False, "error": str(e), "generated_at": _now()}
-        return {"content": [{"type": "json", "data": data}]}
+        return _ok_text_and_struct(data)
 
     if name == "list_suspects":
         try:
@@ -254,12 +298,14 @@ def _handle_tools_call(params: Dict[str, Any]) -> Dict[str, Any]:
             overview, _ = analyze_pcap(str(p), time_window_s=60, top_k=200)
             interval = max(1, int(overview.get("interval_s", 0)) or 1)
             suspects: List[Dict[str, Any]] = []
+            min_ports = int(arguments.get("min_ports", 2))
+            min_rate_pps = float(arguments.get("min_rate_pps", 1.0))
             for s in overview.get("scanners", []):
                 pkts = int(s.get("pkts", 0))
                 dp = int(s.get("distinct_ports", 0))
                 dh = int(s.get("distinct_hosts", 0))
                 rate = pkts / float(interval)
-                if dp >= int(arguments.get("min_ports", 2)) and rate >= float(arguments.get("min_rate_pps", 1.0)):
+                if dp >= min_ports and rate >= min_rate_pps:
                     suspects.append({
                         "scanner": s.get("ip"),
                         "pattern": s.get("pattern") or "mixed",
@@ -276,10 +322,9 @@ def _handle_tools_call(params: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             log.exception("list_suspects error")
             data = {"ok": False, "error": str(e), "generated_at": _now()}
-        return {"content": [{"type": "json", "data": data}]}
+        return _ok_text_and_struct(data)
 
     if name == "enrich_ip":
-        # --- reemplazado: valida token + IP antes de enriquecer ---
         try:
             _require_token(arguments.get("auth_token"))
             ip = str(arguments.get("ip", "")).strip()
@@ -288,10 +333,9 @@ def _handle_tools_call(params: Dict[str, Any]) -> Dict[str, Any]:
             data = {"ok": True, "enrichment": _safe_enrich_ip(ip), "generated_at": _now()}
         except Exception as e:
             data = {"ok": False, "error": str(e), "generated_at": _now()}
-        return {"content": [{"type": "json", "data": data}]}
+        return _ok_text_and_struct(data)
 
     if name == "correlate":
-        # --- reemplazado: valida IPs, marca inválidas con ok:false, conserva rationale ---
         try:
             _require_token(arguments.get("auth_token"))
             ips_in = list(arguments.get("ips") or [])
@@ -333,11 +377,10 @@ def _handle_tools_call(params: Dict[str, Any]) -> Dict[str, Any]:
             data = {"ok": True, "results": out, "generated_at": _now()}
         except Exception as e:
             data = {"ok": False, "error": str(e), "generated_at": _now()}
-        return {"content": [{"type": "json", "data": data}]}
+        return _ok_text_and_struct(data)
 
-    return {"content": [{"type": "json", "data": {"ok": False, "error": "unknown_tool"}}]}
+    return _ok_text_and_struct({"ok": False, "error": "unknown_tool"})
 
-# ---------- Bucle principal ----------
 def _handle_request(req: Dict[str, Any]) -> Dict[str, Any]:
     rid = req.get("id")
     method = req.get("method")
@@ -355,14 +398,16 @@ def _handle_request(req: Dict[str, Any]) -> Dict[str, Any]:
         return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": str(e)}}
 
 def main() -> None:
+    # importantísimo: no usar print; solo escribir JSON por stdout
     fin = sys.stdin.buffer
     fout = sys.stdout.buffer
     while True:
-        req = _read_msg(fin)
+        req = _read_msg_line(fin)
         if req is None:
+            # EOF o línea vacía → salida limpia
             break
         resp = _handle_request(req)
-        _write_msg(fout, resp)
+        _write_msg_line(fout, resp)
 
 if __name__ == "__main__":
     try:
