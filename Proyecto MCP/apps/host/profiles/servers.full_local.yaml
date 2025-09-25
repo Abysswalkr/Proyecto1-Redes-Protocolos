@@ -1,0 +1,11 @@
+transport: stdio
+servers:
+  - name: filesystem
+    # En Windows, mejor que el host invoque npx.cmd (ver patch de stdio_client abajo).
+    command: ["npx","-y","@modelcontextprotocol/server-filesystem","."]
+  - name: git
+    # El server Git (Python) no usa --workdir; arrancar “pelado”
+    command: ["python","-m","mcp_server_git"]
+  - name: porthunter
+    # Llamamos por módulo para evitar problemas de cwd
+    command: ["python","-m","servers.porthunter.server"]

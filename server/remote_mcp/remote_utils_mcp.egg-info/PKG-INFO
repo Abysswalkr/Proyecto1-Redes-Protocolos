@@ -1,8 +1,0 @@
-Metadata-Version: 2.4
-Name: remote-utils-mcp
-Version: 0.1.0
-Summary: Remote Utils MCP (SSE/HTTP)
-Requires-Python: >=3.10
-Requires-Dist: mcp>=1.13.0
-Requires-Dist: uvicorn>=0.31
-Requires-Dist: starlette>=0.40

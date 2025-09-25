@@ -1,0 +1,5 @@
+# apps/host/profiles/servers.only_git.yaml
+transport: stdio
+servers:
+  - name: git
+    command: ["python","-m","mcp_server_git"]
