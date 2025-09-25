@@ -1,8 +1,8 @@
 {
   "build": {
     "builder": "DOCKERFILE",
-    "dockerfilePath": "Dockerfile",
-    "context": "."
+    "dockerfilePath": "Proyecto MCP/Dockerfile",
+    "context": "Proyecto MCP"
   },
   "deploy": {
     "startCommand": "",
