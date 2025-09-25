@@ -1,0 +1,2 @@
+[console_scripts]
+porthunter-mcp = servers.porthunter.server:__main__

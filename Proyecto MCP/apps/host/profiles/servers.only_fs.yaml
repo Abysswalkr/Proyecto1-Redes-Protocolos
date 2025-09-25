@@ -1,0 +1,5 @@
+# apps/host/profiles/servers.only_fs.yaml
+transport: stdio
+servers:
+  - name: filesystem
+    command: ["npx","-y","@modelcontextprotocol/server-filesystem","."]

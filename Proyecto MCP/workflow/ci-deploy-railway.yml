@@ -1,0 +1,73 @@
+name: CI & Deploy (Railway)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps (project)
+        run: |
+          python -m pip install --upgrade pip
+          # Si tienes pyproject.toml:
+          pip install -e .
+          # Asegura pytest (por si no viene en extras):
+          pip install pytest
+          # Si usas requirements.txt, reemplaza por:
+          # pip install -r requirements.txt
+
+      - name: Run pytest
+        run: pytest -q
+
+  deploy:
+    name: Deploy to Railway
+    needs: [ test ]
+    runs-on: ubuntu-latest
+
+    # Usamos la imagen oficial del CLI de Railway (recomendado por Railway)
+    # Fuente: Railway blog "Using Github Actions with Railway"
+    # https://blog.railway.com/p/github-actions
+    container: ghcr.io/railwayapp/cli:latest
+
+    defaults:
+      run:
+        working-directory: ./servers/remote/trivia_http
+
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      SVC_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+
+      - name: Deploy (railway up)
+        run: |
+          # Sube el directorio actual como nuevo deploy al servicio indicado
+          railway up --service="$SVC_ID" --detach
+          # --detach evita que el job se quede tailing de logs
+
+      - name: Show service info
+        run: |
+          railway status --service="$SVC_ID" || true

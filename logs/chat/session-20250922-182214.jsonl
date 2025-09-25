@@ -1,2 +1,0 @@
-{"t": "2025-09-22T18:23:16.873008+00:00", "kind": "llm_router_decision", "input": "escribe README con \"Hola\" en .\\demo_repo", "decision": {"mode": "command", "command": "escribe README con \"Hola\" en .\\demo_repo"}}
-{"t": "2025-09-22T18:23:28.212861+00:00", "kind": "exec_command", "command": "escribe README con \"Hola\" en .\\demo_repo", "result": {"ok": true, "result": {"content": [{"type": "text", "text": "Successfully wrote to C:\\Users\\joses\\PycharmProjects\\Proyecto1-Redes-Protocolos\\demo_repo\\README.md"}]}}, "dt_ms": 14181}

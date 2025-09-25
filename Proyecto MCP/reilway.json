@@ -1,0 +1,15 @@
+{
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "servers/remote/trivia_http/Dockerfile"
+  },
+  "deploy": {
+    "startCommand": "",
+    "healthcheckPath": "/health",
+    "healthcheckTimeout": 120
+  },
+  "env": {
+    "TRIVIA_SECRET": "please-change-me",
+    "TRIVIA_TOKEN_TTL": "3600"
+  }
+}

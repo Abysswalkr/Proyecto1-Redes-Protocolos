@@ -1,0 +1,25 @@
+# profiles/local+remote.yaml
+# Perfil mixto: STDIO (local) + HTTP (remoto)
+servers:
+  - name: filesystem
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    env: {}
+  - name: git
+    transport: stdio
+    command: uvx
+    args: ["mcp-server-git", "--repository", "."]
+    env: {}
+  - name: porthunter
+    transport: stdio
+    command: python
+    args: ["-m", "servers.porthunter.server"]
+    env:
+      PORT_HUNTER_ALLOWED_DIR: "."
+      PORT_HUNTER_REQUIRE_TOKEN: "false"
+  - name: trivia_http
+    transport: http
+    url: "${TRIVIA_URL}"
+    # Ej: https://<subdominio>.up.railway.app/mcp
+    headers: {}

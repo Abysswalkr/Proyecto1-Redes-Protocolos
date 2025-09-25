@@ -1,0 +1,5 @@
+# apps/host/profiles/servers.porthunter.yaml
+transport: stdio
+servers:
+  - name: porthunter
+    command: ["python","-m","servers.porthunter.server"]
